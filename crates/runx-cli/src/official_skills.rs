@@ -281,6 +281,11 @@ pub(crate) const OFFICIAL_SKILLS: &[OfficialSkillLockEntry] = &[
         digest: "2358e19a81b07f70bdefee629290d7d132592b8b9f6491abedd44d4bf6837810",
     },
     OfficialSkillLockEntry {
+        skill_id: "runx/reddit",
+        version: "sha-f7c7e6198bd8",
+        digest: "0b64567ead780b5a4daf870d1758bf07966cc72b718a4e4dda429b86267feddb",
+    },
+    OfficialSkillLockEntry {
         skill_id: "runx/reflect-digest",
         version: "sha-f42f26daaeab",
         digest: "d5157d4d018f3e13815e0d28296cfe7d0bd97d1584f54bfc91459d23a16e59fd",

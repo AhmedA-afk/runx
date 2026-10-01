@@ -119,8 +119,17 @@ describe("official skill catalog", () => {
       expect(
         fixtures
           .filter((entry) => entry.kind === "graph")
-          .every((entry) => entry.target?.startsWith("../harness/") === true),
-        `${skillName} journey fixtures must target their package harness`,
+          .every((entry) => {
+            if (entry.target?.startsWith("../harness/") === true) return true;
+            // Native package admission requires explicit harness support files
+            // under fixtures/. Match that declared edge as well as legacy harness/.
+            const target = entry.target;
+            return typeof target === "string"
+              && !path.posix.isAbsolute(target)
+              && !target.split("/").some((part) => part === "." || part === ".." || part === "")
+              && (manifest.harness?.files ?? []).includes(`fixtures/${target}`);
+          }),
+        `${skillName} journey fixtures must target their package harness or declared fixture support`,
       ).toBe(true);
     }
   });

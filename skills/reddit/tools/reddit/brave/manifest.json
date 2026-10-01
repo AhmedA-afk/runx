@@ -1,0 +1,22 @@
+{
+  "schema": "runx.tool.manifest.v1",
+  "name": "reddit.brave",
+  "version": "0.1.0",
+  "description": "Read a named Reddit session through a fixed, account-bound Brave operator on macOS.",
+  "source": {
+    "type": "cli-tool",
+    "command": "python3",
+    "args": ["./brave.py"]
+  },
+  "inputs": {
+    "operation": {"type": "string", "required": true, "description": "One fixed operator command: tabs, bind, inspect, navigate, feed, rules, thread, composer, or comment-readback."},
+    "account": {"type": "string", "required": false, "description": "Configured lowercase Reddit account id."},
+    "window_id": {"type": "string", "required": false, "description": "Bound Brave window id for bind."},
+    "tab_id": {"type": "string", "required": false, "description": "Bound Brave tab id for bind."},
+    "profile_ref": {"type": "string", "required": false, "description": "Configured non-secret browser profile label for bind."},
+    "url": {"type": "string", "required": false, "description": "Exact Reddit navigation or comment permalink URL."},
+    "body_file": {"type": "string", "required": false, "description": "UTF-8 file containing the exact approved body for comment readback."}
+  },
+  "scopes": ["fs:write", "host:browser:read"],
+  "retry": {"max_attempts": 1}
+}
