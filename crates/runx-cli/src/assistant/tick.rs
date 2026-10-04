@@ -83,7 +83,7 @@ struct WorkAssignment {
     #[serde(default)]
     retry_after_unix_seconds: u64,
     receipt: Option<String>,
-    result: Option<Value>,
+    result_ref: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -524,6 +524,42 @@ fn read_control(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result<Cont
     Ok(ControlRecord { version, state })
 }
 
+fn persist_work_result(
+    workspace: &WorkspaceEnv,
+    item: &WorkAssignment,
+    result: &Value,
+) -> Result<Value, String> {
+    let value = serde_json::from_value(result.clone())
+        .map_err(|error| format!("encoding assistant work result: {error}"))?;
+    let reference = crate::skill::output::persist_json_artifact(
+        &project_runx_dir(workspace),
+        &format!(
+            "run_assistant_work_{}",
+            item.id.trim_start_matches("sha256:")
+        ),
+        "assistant-work",
+        "result",
+        &value,
+    )?;
+    serde_json::to_value(reference)
+        .map_err(|error| format!("encoding assistant work result reference: {error}"))
+}
+
+fn read_work_result(
+    workspace: &WorkspaceEnv,
+    item: &WorkAssignment,
+) -> Result<Option<Value>, String> {
+    let Some(reference) = item.result_ref.as_ref() else {
+        return Ok(None);
+    };
+    let reference = serde_json::from_value(reference.clone())
+        .map_err(|error| format!("decoding assistant work result reference: {error}"))?;
+    let value = crate::skill::output::read_json_artifact(&project_runx_dir(workspace), &reference)?;
+    serde_json::to_value(value)
+        .map(Some)
+        .map_err(|error| format!("decoding assistant work result: {error}"))
+}
+
 fn write_control(
     loaded: &LoadedProfile,
     workspace: &WorkspaceEnv,
@@ -741,7 +777,21 @@ pub(super) fn work(
     workspace: &WorkspaceEnv,
     cursor: Option<&str>,
 ) -> Result<Value, String> {
-    let assignments = read_control(loaded, workspace)?.state.work;
+    let assignments = read_control(loaded, workspace)?
+        .state
+        .work
+        .iter()
+        .map(|item| {
+            let mut projection = serde_json::to_value(item)
+                .map_err(|error| format!("encoding assistant work item: {error}"))?;
+            projection
+                .as_object_mut()
+                .ok_or("assistant work item is not an object")?
+                .remove("result_ref");
+            projection["result"] = json!(read_work_result(workspace, item)?);
+            Ok::<Value, String>(projection)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut inputs = json!({"data_source_ref":loaded.profile.inbox_data_source_ref,"limit":20});
     if let Some(cursor) = cursor {
         inputs["cursor"] = json!(cursor);
@@ -1338,17 +1388,22 @@ fn review_observations(
                     .iter()
                     .any(|item| item["source_digest"] == work.source_digest)
         })
-        .filter_map(|work| {
-            let result = work.result.as_ref()?;
-            let receipt = work.receipt.as_ref()?;
+        .take(20)
+        .map(|work| -> Result<Option<Value>, String> {
+            let Some(result) = read_work_result(workspace, work)? else {
+                return Ok(None);
+            };
+            let Some(receipt) = work.receipt.as_ref() else {
+                return Ok(None);
+            };
             if result["kind"] == "source_intake" {
                 if result["summary"].as_str().is_none()
                     || result["recommended_lane"].as_str().is_none()
                     || result["checked_at"].as_str().is_none()
                 {
-                    return None;
+                    return Ok(None);
                 }
-                return Some(json!({
+                return Ok(Some(json!({
                     "source_ref":work.source_ref,
                     "source_digest":work.source_digest,
                     "route_id":work.route_id,
@@ -1359,15 +1414,15 @@ fn review_observations(
                     "source_complete":result["source_complete"],
                     "checked_at":result["checked_at"],
                     "receipt":receipt,
-                }));
+                })));
             }
             if result["kind"] == "work_plan" {
                 if result["change_set_id"].as_str().is_none()
                     || !matches!(result["decision"].as_str(), Some("ready" | "blocked"))
                 {
-                    return None;
+                    return Ok(None);
                 }
-                return Some(json!({
+                return Ok(Some(json!({
                     "source_ref":work.source_ref,
                     "source_digest":work.source_digest,
                     "route_id":work.route_id,
@@ -1377,15 +1432,15 @@ fn review_observations(
                     "change_set_id":result["change_set_id"],
                     "checked_at":result["checked_at"],
                     "receipt":receipt,
-                }));
+                })));
             }
             if !matches!(result["state"].as_str(), Some("open" | "closed"))
                 || result["title"].as_str().is_none()
                 || result["checked_at"].as_str().is_none()
             {
-                return None;
+                return Ok(None);
             }
-            Some(json!({
+            Ok(Some(json!({
                 "source_ref":work.source_ref,
                 "source_digest":work.source_digest,
                 "route_id":work.route_id,
@@ -1394,9 +1449,11 @@ fn review_observations(
                 "title":result["title"],
                 "checked_at":result["checked_at"],
                 "receipt":receipt
-            }))
+            })))
         })
-        .take(20)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     let mut candidates = work_candidates(loaded, observations);
     candidates.retain(|candidate| {
@@ -1746,7 +1803,7 @@ fn admit_work(
             status: "pending".to_owned(),
             retry_after_unix_seconds: 0,
             receipt: None,
-            result: None,
+            result_ref: None,
         });
         changed = true;
     }
@@ -1816,7 +1873,7 @@ fn dispatch_pending_work(
     };
     record.state.work[index].status = "completed".to_owned();
     record.state.work[index].receipt = Some(receipt.clone());
-    record.state.work[index].result = Some(result.clone());
+    record.state.work[index].result_ref = Some(persist_work_result(workspace, &item, &result)?);
     if let Some(child) = child
         && !record.state.work.iter().any(|entry| entry.id == child.id)
     {
@@ -1953,7 +2010,7 @@ fn plan_child_assignment(
         status: "pending".to_owned(),
         retry_after_unix_seconds: 0,
         receipt: None,
-        result: None,
+        result_ref: None,
     }))
 }
 
@@ -1975,11 +2032,9 @@ fn run_work_plan(
                 && entry.thread_locator == item.thread_locator
         })
         .ok_or("work plan lacks a completed source-intake parent")?;
-    let source_result = parent
-        .result
-        .as_ref()
-        .ok_or("work plan parent has no intake result")?;
-    let change_set = plannable_change_set(parent, source_result)
+    let source_result =
+        read_work_result(workspace, parent)?.ok_or("work plan parent has no intake result")?;
+    let change_set = plannable_change_set(parent, &source_result)
         .filter(|set| set["change_set_id"] == item.target_ref)
         .ok_or("work plan parent does not authorize this exact planning target")?;
     bounded_work_artifact(change_set)?;
@@ -3252,11 +3307,46 @@ mod tests {
         DeferredTurn, PendingTurn, WorkAssignment, WorkerLane, bounded_mail_context,
         bounded_work_artifact, due_work_index, due_worker_lane, evictable_work_index,
         message_for_queue, next_work_due, normalize_mail_observation, notification_uuid,
-        page_cursor, parse_pr_target, plan_child_assignment, plannable_change_set,
-        private_notification_text, private_text_is_safe, quiet_hour, scan_continuation_from_value,
-        unreviewed_digests, verified_notification_readback,
+        page_cursor, parse_pr_target, persist_work_result, plan_child_assignment,
+        plannable_change_set, private_notification_text, private_text_is_safe, quiet_hour,
+        read_work_result, scan_continuation_from_value, unreviewed_digests,
+        verified_notification_readback,
     };
     use crate::assistant::{QuietHours, WorkRoute};
+
+    #[test]
+    fn work_result_is_exact_private_artifact_and_tampering_blocks_read() -> Result<(), String> {
+        let root = std::env::temp_dir().join(format!(
+            "runx-assistant-work-result-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).map_err(|error| error.to_string())?;
+        let workspace = runx_runtime::WorkspaceEnv::load_process(root.clone())
+            .map_err(|error| error.to_string())?;
+        let mut item: WorkAssignment = serde_json::from_value(json!({
+            "id":"work-1", "source_ref":"slack://message", "source_digest":"digest",
+            "thread_locator":"slack://thread", "route_id":"intake",
+            "target_ref":"slack://thread", "status":"completed",
+            "receipt":"sha256:receipt", "result_ref":null
+        }))
+        .map_err(|error| error.to_string())?;
+        let result = json!({"kind":"source_intake","change_set":{"summary":"private context"}});
+        item.result_ref = Some(persist_work_result(&workspace, &item, &result)?);
+        assert_eq!(read_work_result(&workspace, &item)?, Some(result));
+        let path = item
+            .result_ref
+            .as_ref()
+            .and_then(|reference| reference["path"].as_str())
+            .ok_or("work result reference lacks path")?;
+        std::fs::write(path, b"{}").map_err(|error| error.to_string())?;
+        assert!(read_work_result(&workspace, &item).is_err());
+        std::fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
 
     #[test]
     fn held_delivery_does_not_starve_due_assignment() {
@@ -3278,7 +3368,7 @@ mod tests {
             "id":"first", "source_ref":"slack://one", "source_digest":"digest",
             "thread_locator":"slack://thread", "route_id":"intake",
             "target_ref":"slack://thread", "status":"pending",
-            "receipt":null, "result":null
+            "receipt":null, "result_ref":null
         }))
         .map_err(|error| error.to_string())?;
         assert_eq!(old.retry_after_unix_seconds, 0);
@@ -3305,7 +3395,7 @@ mod tests {
             "id":"intake", "source_ref":"slack://message", "source_digest":"digest",
             "thread_locator":"slack://thread", "route_id":"intake",
             "target_ref":"slack://thread", "status":"completed",
-            "receipt":"sha256:receipt", "result":null
+            "receipt":"sha256:receipt", "result_ref":null
         }))
         .map_err(|error| error.to_string())?;
         let approved = json!({
