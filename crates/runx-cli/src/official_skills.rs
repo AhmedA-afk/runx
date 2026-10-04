@@ -126,6 +126,11 @@ pub(crate) const OFFICIAL_SKILLS: &[OfficialSkillLockEntry] = &[
         digest: "d6c23b6ec788fc4f06711c445ed8faa3121b2705568dcda805d4635cc29a8bd2",
     },
     OfficialSkillLockEntry {
+        skill_id: "runx/google-calendar",
+        version: "sha-de6aae019ffd",
+        digest: "9d3fc693d0668fa612c1ff93a3094a88d71ac74ce13c3627cc912059be9eec7c",
+    },
+    OfficialSkillLockEntry {
         skill_id: "runx/google-search-console",
         version: "sha-f6991b80704f",
         digest: "bf6ab059b5f6e42f48c0370183f06945168e72f0d79f11293fc2304e850569c9",
