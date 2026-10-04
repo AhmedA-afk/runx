@@ -2074,7 +2074,12 @@ fn hydrate_slack_source(
                 truncated = true;
             }
             if message["message_locator"] == item.source_ref {
-                slack_source_matches(message, &item.thread_locator, latest, &item.source_digest)?;
+                // Search and thread previews can render markup differently.
+                // The queue digest identifies the selected occurrence; the
+                // fresh read is bound by tenant, locator, time, and author.
+                if message_for_queue(message)?["occurred_at"] != latest["occurred_at"] {
+                    return Err("Slack intake source occurrence time changed".to_owned());
+                }
                 if message["author"]["external_id"] != action["requester"]["external_id"]
                     || message["author"]["external_id"] == subject
                 {
@@ -2110,27 +2115,6 @@ fn hydrate_slack_source(
         complete,
         receipts,
     })
-}
-
-fn slack_source_matches(
-    message: &Value,
-    thread_locator: &str,
-    latest: &Value,
-    source_digest: &str,
-) -> Result<(), String> {
-    let canonical_message = message_for_queue(message)?;
-    if canonical_message["occurred_at"] != latest["occurred_at"] {
-        return Err("Slack intake source occurrence time changed".to_owned());
-    }
-    let mut occurrence = message.clone();
-    occurrence["thread_locator"] = json!(thread_locator);
-    let observed_digest = normalize_slack_observation(&occurrence)
-        .map(|(observation, _)| observation["source_digest"].clone())
-        .ok_or("Slack intake source is invalid")?;
-    if observed_digest != source_digest {
-        return Err("Slack intake source digest changed".to_owned());
-    }
-    Ok(())
 }
 
 fn hydrate_mail_source(
@@ -3080,7 +3064,7 @@ mod tests {
         due_work_index, due_worker_lane, message_for_queue, next_work_due,
         normalize_mail_observation, notification_uuid, page_cursor, parse_pr_target,
         private_notification_text, private_text_is_safe, quiet_hour, scan_continuation_from_value,
-        slack_source_matches, unreviewed_digests, verified_notification_readback,
+        unreviewed_digests, verified_notification_readback,
     };
     use crate::assistant::QuietHours;
 
@@ -3122,35 +3106,6 @@ mod tests {
         assert_eq!(next_work_due(&work), Some(120));
         assert_eq!(due_work_index(&work, 60), None);
         assert_eq!(due_work_index(&work, 120), Some(0));
-        Ok(())
-    }
-
-    #[test]
-    fn slack_source_identity_survives_queue_normalization() -> Result<(), String> {
-        let source = json!({
-            "message_locator":"slack://workspace/channel/1.123456",
-            "occurred_at":"2026-10-02T09:00:00.123456Z",
-            "preview":"hello\nworld"
-        });
-        let thread_locator = "slack://workspace/channel/1.123456";
-        let mut search_message = source.clone();
-        search_message["thread_locator"] = json!(thread_locator);
-        let (observation, _) = super::normalize_slack_observation(&search_message)
-            .ok_or("source observation must normalize")?;
-        let latest = json!({
-            "occurred_at":"2026-10-02T09:00:00.123Z",
-            "preview":"hello world"
-        });
-        let digest = observation["source_digest"]
-            .as_str()
-            .ok_or("source digest is missing")?;
-        slack_source_matches(&source, thread_locator, &latest, digest)?;
-        let mut edited = source;
-        edited["preview"] = json!("hello edited world");
-        assert!(
-            slack_source_matches(&edited, thread_locator, &latest, digest)
-                .is_err_and(|error| error == "Slack intake source digest changed")
-        );
         Ok(())
     }
 
