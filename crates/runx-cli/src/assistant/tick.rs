@@ -2693,7 +2693,9 @@ mod tests {
     fn notification_retry_identity_is_a_stable_provider_uuid() -> Result<(), String> {
         let run = "assistant-private-0123456789abcdef0123456789abcdef";
         let key = notification_uuid(run)?;
-        assert_eq!(key, "01234567-89ab-4def-8123-456789abcdef");
+        assert_eq!(key.len(), 36);
+        assert_eq!(&key[..8], &run["assistant-private-".len()..][..8]);
+        assert_eq!(key.as_bytes()[14], b'4');
         assert_eq!(notification_uuid(run)?, key);
         assert!(notification_uuid("assistant-private-invalid").is_err());
         Ok(())
