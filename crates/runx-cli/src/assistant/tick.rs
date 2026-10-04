@@ -24,6 +24,7 @@ use super::{LoadedProfile, QuietHours, SourceProfile, model_environment};
 
 const CONTROL_SCHEMA: &str = "runx.assistant.control.v1";
 const MAX_OBSERVATIONS: usize = 20;
+const MAX_DEFERRED_TURNS: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +40,8 @@ struct Control {
     #[serde(default)]
     pending_turn: Option<PendingTurn>,
     pending_intent: Option<PendingIntent>,
+    #[serde(default)]
+    deferred_turns: Vec<DeferredTurn>,
     last_handled_material_digest: Option<String>,
     last_delivered_material_digest: Option<String>,
     last_handled_receipt: Option<String>,
@@ -96,6 +99,15 @@ struct PendingIntent {
 struct PendingTurn {
     pages: Vec<PinnedPage>,
     review_ref: Option<Value>,
+    #[serde(default)]
+    deferred: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeferredTurn {
+    pages: Vec<PinnedPage>,
+    occurrence_digests: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +232,7 @@ fn control_default(loaded: &LoadedProfile) -> Control {
         active_run_id: None,
         pending_turn: None,
         pending_intent: None,
+        deferred_turns: Vec::new(),
         last_handled_material_digest: None,
         last_delivered_material_digest: None,
         last_handled_receipt: None,
@@ -551,6 +564,7 @@ pub(super) fn status(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result
         "pending_page_count": record.state.pending_turn.as_ref().map_or(0, |turn| turn.pages.len()),
         "pending_review": record.state.pending_turn.as_ref().is_some_and(|turn| turn.review_ref.is_some()),
         "pending_notification": record.state.pending_intent.is_some(),
+        "deferred_attention_turns":record.state.deferred_turns.len(),
         "last_handled_receipt": record.state.last_handled_receipt,
         "last_blocker": record.state.last_blocker,
         "scan_retry_from_first_page": record.state.scan_retry_from_first_page
@@ -870,6 +884,16 @@ pub(super) fn tick(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result<V
             intake_while_delivery_pending,
         );
     }
+    if record.state.pending_turn.is_none() && !record.state.deferred_turns.is_empty() {
+        let deferred = record.state.deferred_turns.remove(0);
+        record.state.active_run_id = Some(new_run_id(&loaded.profile.instance_id)?);
+        record.state.pending_turn = Some(PendingTurn {
+            pages: deferred.pages,
+            review_ref: None,
+            deferred: true,
+        });
+        write_control(loaded, workspace, &mut record, "replay_deferred_attention")?;
+    }
     if record.state.active_run_id.is_some() && record.state.pending_turn.is_none() {
         record.state.active_run_id = None;
         record.state.scan_retry_from_first_page = true;
@@ -885,6 +909,7 @@ pub(super) fn tick(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result<V
         record.state.pending_turn = Some(PendingTurn {
             pages: Vec::new(),
             review_ref: None,
+            deferred: false,
         });
         write_control(loaded, workspace, &mut record, "begin")?;
     }
@@ -901,14 +926,55 @@ fn intake_while_delivery_pending(
     record: &mut ControlRecord,
 ) -> Result<Value, String> {
     if record.state.pending_turn.is_none() {
+        if record.state.deferred_turns.len() >= MAX_DEFERRED_TURNS {
+            record.state.next_due_unix_seconds = scheduled_due(loaded.profile.min_check_minutes);
+            write_control(loaded, workspace, record, "attention_backlog_full")?;
+            return Ok(json!({
+                "status":"attention_backlog_full",
+                "deferred_attention_turns":record.state.deferred_turns.len(),
+                "pending_notification":true
+            }));
+        }
         record.state.active_run_id = Some(new_run_id(&loaded.profile.instance_id)?);
         record.state.pending_turn = Some(PendingTurn {
             pages: Vec::new(),
             review_ref: None,
+            deferred: false,
         });
         write_control(loaded, workspace, record, "begin_held_intake")?;
     }
     let (observations, coverage_incomplete) = collect_observations(loaded, workspace, record)?;
+    let new_digests = unreviewed_digests(
+        &record.state.handled_occurrence_digests,
+        record
+            .state
+            .pending_intent
+            .as_ref()
+            .map(|intent| intent.selected_digests.as_slice())
+            .unwrap_or(&[]),
+        &record.state.deferred_turns,
+        &observations,
+    );
+    if !new_digests.is_empty() {
+        if record.state.deferred_turns.len() >= MAX_DEFERRED_TURNS {
+            return Err(
+                "assistant attention backlog is full; source cursor was not advanced".to_owned(),
+            );
+        }
+        let pages = record
+            .state
+            .pending_turn
+            .as_ref()
+            .ok_or("assistant held intake lacks pinned pages")?
+            .pages
+            .clone();
+        record.state.deferred_turns.push(DeferredTurn {
+            pages,
+            occurrence_digests: new_digests,
+        });
+        // Persist the exact source references before advancing a scan cursor.
+        write_control(loaded, workspace, record, "attention_deferred")?;
+    }
     commit_pending_pages(loaded, workspace, record)?;
     record.state.pending_turn = None;
     record.state.active_run_id = None;
@@ -919,8 +985,31 @@ fn intake_while_delivery_pending(
         "status":"intake_committed",
         "observation_count":observations.len(),
         "coverage_incomplete":coverage_incomplete,
-        "pending_notification":true
+        "pending_notification":true,
+        "deferred_attention_turns":record.state.deferred_turns.len()
     }))
+}
+
+fn unreviewed_digests(
+    handled: &[String],
+    already_pending: &[String],
+    deferred: &[DeferredTurn],
+    observations: &[Value],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    observations
+        .iter()
+        .filter_map(|item| item["source_digest"].as_str())
+        .filter(|digest| {
+            !handled.iter().any(|item| item == digest)
+                && !already_pending.iter().any(|item| item == digest)
+                && !deferred
+                    .iter()
+                    .any(|turn| turn.occurrence_digests.iter().any(|item| item == digest))
+                && seen.insert(*digest)
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Work and delivery use native pinned run identities. A separate local
@@ -1290,6 +1379,9 @@ fn commit_pending_pages(
         .pending_turn
         .as_ref()
         .ok_or("assistant turn lacks pinned work")?;
+    if pending.deferred {
+        return Ok(());
+    }
     if pending.pages.len() != loaded.profile.sources.len() {
         return Err("assistant turn lacks a complete pinned source set".to_owned());
     }
@@ -1964,6 +2056,9 @@ fn deliver_pending(
     }
     record.state.pending_intent = None;
     record.state.active_run_id = None;
+    if !record.state.deferred_turns.is_empty() {
+        record.state.next_due_unix_seconds = 0;
+    }
     record.state.next_worker_due_unix_seconds = 0;
     write_control(loaded, workspace, record, "delivered")?;
     Ok(json!({"status":"delivered","receipt":receipt}))
@@ -2553,11 +2648,40 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        message_for_queue, normalize_mail_observation, notification_uuid, page_cursor,
-        parse_pr_target, private_notification_text, private_text_is_safe, quiet_hour,
-        scan_continuation_from_value, verified_notification_readback,
+        DeferredTurn, PendingTurn, message_for_queue, normalize_mail_observation,
+        notification_uuid, page_cursor, parse_pr_target, private_notification_text,
+        private_text_is_safe, quiet_hour, scan_continuation_from_value, unreviewed_digests,
+        verified_notification_readback,
     };
     use crate::assistant::QuietHours;
+
+    #[test]
+    fn pending_delivery_preserves_only_new_attention_and_old_turns_decode() -> Result<(), String> {
+        let previous: PendingTurn = serde_json::from_value(json!({"pages":[],"review_ref":null}))
+            .map_err(|error| error.to_string())?;
+        assert!(!previous.deferred);
+        let deferred = [DeferredTurn {
+            pages: Vec::new(),
+            occurrence_digests: vec!["second".to_owned()],
+        }];
+        let observations = [
+            json!({"source_digest":"handled"}),
+            json!({"source_digest":"pending"}),
+            json!({"source_digest":"second"}),
+            json!({"source_digest":"new"}),
+            json!({"source_digest":"new"}),
+        ];
+        assert_eq!(
+            unreviewed_digests(
+                &["handled".to_owned()],
+                &["pending".to_owned()],
+                &deferred,
+                &observations,
+            ),
+            vec!["new"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn mailbox_requires_a_grounded_message_and_current_thread() -> Result<(), &'static str> {
