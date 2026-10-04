@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// keep receipt content stable. Live runtime paths should call [`now_iso8601`].
 pub(crate) const DEFAULT_CREATED_AT: &str = "2026-05-18T00:00:00Z";
 
-pub(crate) fn now_iso8601() -> String {
+pub fn now_iso8601() -> String {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

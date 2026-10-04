@@ -30,6 +30,7 @@ mod javascript_worker_support;
 mod journal_history;
 mod license_boundary;
 mod local_credential_provision;
+mod managed_openai;
 mod mcp_adapter;
 mod mcp_server;
 mod parity;

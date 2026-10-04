@@ -1,0 +1,171 @@
+# Local personal assistant
+
+`runx assistant` runs one finite, bounded turn in Runx OSS. The CLI hosts the
+schedule and pins configuration; existing skills own Slack and Nitrosend reads,
+the operator inbox, data-store state, attention judgment, and notification
+delivery. It uses an OpenAI-compatible **loopback** text endpoint (for example,
+an MLX server running Qwen 2.5 or Qwen 3.5). Runx does not start or download a
+model. No resident Runx process is needed: an optional macOS launchd job invokes
+`tick`, and the persisted next-due time prevents unnecessary provider or model
+calls.
+
+The profile is a private JSON file (`chmod 600`). Keep account identifiers and
+the exact audience there, outside the OSS skill package:
+
+```json
+{
+  "schema": "runx.assistant.profile.v1",
+  "instance_id": "personal",
+  "skills_root": "/absolute/path/to/runx/oss/skills",
+  "data_source_ref": "local://runx-data-store/personal-assistant",
+  "inbox_data_source_ref": "local://runx-data-store/operator-inbox",
+  "sources": [
+    {
+      "kind": "slack_mentions",
+      "source_id": "mentions",
+      "query": { "mentions_connected_subject": true, "limit": 10 }
+    },
+    {
+      "kind": "nitrosend_inbox",
+      "source_id": "mailbox",
+      "brand_sid": "brnd_example",
+      "arguments": { "view": "full", "page": 1, "per": 10 },
+      "credential_profile": null
+    }
+  ],
+  "allowed_action_ids": [],
+  "work_routes": [
+    {
+      "route_id": "pr_status",
+      "kind": "github_pr_status",
+      "repositories": ["example/project"],
+      "credential_profile": null
+    }
+  ],
+  "charter": "Prioritize direct requests requiring a decision; keep routine status low priority.",
+  "confidential_terms": [],
+  "model": {
+    "model": "your-served-qwen2.5-id",
+    "endpoint_url": "http://127.0.0.1:1234/v1",
+    "max_rounds": 8
+  },
+  "notification": null,
+  "heartbeat_seconds": 300,
+  "min_check_minutes": 15,
+  "max_check_minutes": 60,
+  "quiet_hours": { "start_hour": 22, "end_hour": 8 }
+}
+```
+
+The source-page limits must total at most 20. Nitrosend sources require
+`view: "full"`: each mailbox row is followed by a bounded `get_thread` read,
+and the row's conversation identity and timestamps must match that read before
+the assistant records the provider's actual message ID. Each turn reads one
+bounded page per source. It pins the normalized pages and review in private,
+digest-bound artifacts before advancing operator-inbox scan cursors. After a
+crash or a caught error, the same pinned pages replay; an unpinned legacy turn
+restarts at page one. Operator-inbox stores a continuation when another page
+exists, and the next due turn advances that scan. While `coverage_incomplete`
+is true, a brief does not represent a complete mailbox or Slack audit. The
+provider's cursor or page can become stale as the source changes, and a failed
+continuation holds the turn for inspection. Independent cross-source checks
+are still needed before autonomous follow-up actions.
+
+Use `runx assistant check --profile <path>` to validate the profile and installed
+skill packages. `profile_valid` does not certify credentials, notification
+authority, or the model server. `runx assistant resume --profile <path>` enables
+turns; `tick` runs one due turn, and `status` reports control and timer state.
+`pause` prevents future turns. A profile or skill-package change stops active
+ticks until an explicit resume. A pending exact notification cannot be resumed
+with changed bindings; the same applies to a pinned source or review turn.
+`runx assistant report --profile <path>` returns the last persisted, validated
+attention packet with its review receipt and the five most recent completed
+read-only assignments. It reports `not_available` until a turn has committed a
+review. `status.report_available` indicates whether that artifact exists. A
+partial source scan remains marked `coverage_incomplete`; the report is a
+snapshot of that review, not a fresh source read.
+
+The private `charter` is bounded to 2000 bytes and binds to the profile revision.
+Confirmed memory is separate from that file: `runx assistant remember --profile
+<path> --memory-id <id> --text-file <private-file>` appends an operator-confirmed
+entry to the existing local `data-store` control stream. The text file must be
+private (`chmod 600`) and contain 1–300 bytes. `memories` reads the confirmed
+entries; `forget --memory-id <id>` removes one. Status reports only the count.
+Memory changes are rejected during pending work and cause the next scan to
+revisit current observations. Source messages and model guesses never become
+confirmed memory automatically. The review skill receives the charter and
+confirmed entries as typed context alongside its own package manual and the
+current source evidence; it may use context to rank observations, but its
+brief remains bound to actual source references.
+`forget` removes an entry from current context; the append-only data-store
+audit history retains prior events until the local source is separately erased.
+
+`runx assistant work --profile <path>` reads one bounded page of the canonical
+`operator-inbox` action queue with a receipt. Each observed thread has stable
+identity and explicit open/waiting/followed-up/resolved/dismissed state there.
+Pass its `next_cursor` back with `--cursor` to read the next page.
+The assistant does not create a parallel source-action database or infer
+completion from email text. The model proposes a bounded next check and the
+local control stream persists its due time; the heartbeat invokes finite `tick`
+and `execute` roles. A turn with changed evidence may also select up to
+three exact read-only work candidates. V1 supports `github_pr_status`: the host
+extracts canonical PR links from observed summaries, intersects them with the
+private repository allowlist, and asks the model to select exact
+source/route/target triples. The finalizer rejects invented targets and
+non-open source actions. The host records a stable assignment in `data-store`
+before `assistant execute` runs one due `github-sync#pull`. It verifies the exact PR
+identity in provider readback, records state and receipt, and supplies that
+bounded result to later reviews. Read retries reuse the same native run identity
+after a crash; they cannot post or mutate the PR. Intake continues while the
+worker is busy. Completed assignments are
+deduplicated by source occurrence, route, and target. `assistant work` shows
+both canonical inbox actions and these bounded execution assignments.
+
+Additional unattended routes require an explicit typed target mapping and
+configured authority. A model proposal alone never expands the roster or
+creates a provider write. `work_routes: []` disables delegated work.
+Two distinct source occurrences that link the same PR can currently produce
+two reads. Both are bounded and read-only; deduplicating them across occurrences
+requires a freshness rule so a later request can still trigger a new check.
+
+Notification is off when `allowed_action_ids` is empty and `notification` is
+`null`; in that mode a useful brief closes as `ready_undelivered` and is not
+marked handled. To enable delivery, configure `private_update` plus an exact
+private `slack://workspace/channel` target, provider grant, principal, expiry,
+and post/text quotas; install its native standing authority with `grant`.
+Delivery uses a persisted exact intent, a stable graph run identity and
+idempotency key, native permission checks, and provider readback. A dispatched
+intent remains pinned if delivery fails or its outcome is unknown. Repeating
+the same explicit graph run ID recovers its completed checkpoint and signed
+receipt without executing the delivery step again; missing or invalid completion
+evidence holds the run for inspection. The host does not mint a replacement
+identity or silently send again. `tick` pins the intent and `execute` delivers
+it; source intake continues while delivery is pending. This private control
+post uses exact standing authority. Outward messages to other people require
+their owning approval. A notification from a partial scan carries an explicit
+coverage caveat in the exact posted text. `revoke` disables the standing
+authority. Quiet hours defer a pending notification; read-only checks can
+continue during quiet hours even while notification is pending.
+The local host projects each selected item into a short, plain-text notification
+with its full source digest, within the channel's byte quota. The complete
+evidence-bound review, including exact source locators, remains available through
+`report`; if even the digests cannot fit, delivery holds without posting. Source
+markup and active Slack mentions are removed from the notification so a quoted
+message cannot change the posted text or ping others. Source locators are kept
+out of the Slack post because Slack auto-links even code-formatted locators and
+changes the exact text required by provider readback. The final rendered text is
+checked for protected local paths, credential material, system variables and
+private profile terms before intent creation and again before delivery.
+If a pinned notification is blocked before native reservation, pause the profile
+and run `discard-notification`; Runx checks the exact idempotency key in its
+authority ledger before allowing the discard. Resuming then rescans from page
+one and constructs a new intent. A reserved intent cannot be discarded this way
+because its provider outcome may need reconciliation.
+
+On macOS, `install-timer` installs two owned launchd jobs for intake and work,
+and snapshots the exact
+Runx and JavaScript-worker binaries into the instance directory. `remove-timer`
+removes those jobs and only their owned files. Each timer wakes at the configured
+heartbeat; actual work can begin one heartbeat plus OS scheduling delay after
+the persisted due time. Start with manual read-only ticks and inspect receipts
+before installing a timer or enabling delivery.

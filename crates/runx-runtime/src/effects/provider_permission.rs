@@ -1,7 +1,6 @@
 #[cfg(feature = "catalog")]
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "catalog")]
 use runx_contracts::JsonValue;
 use runx_contracts::{Reference, ReferenceType};
 
@@ -30,9 +29,16 @@ mod policy;
 mod readback;
 mod recovery;
 mod scope_transport;
+mod standing;
 
 pub use scope_transport::{
     ProviderScopeTransportError, decode_provider_scopes_env, encode_provider_scopes_env,
+};
+pub use standing::{
+    NOTIFICATION_AUTHORITY_ID_ENV, NOTIFICATION_SOURCE_SET_DIGEST_ENV, NotificationAuthorityError,
+    NotificationAuthorityGrant, NotificationAuthorityGrantSpec, NotificationAuthorityStatus,
+    install_notification_authority, notification_authority_status,
+    notification_intent_has_reservation, revoke_notification_authority,
 };
 
 use approval::{
@@ -220,6 +226,8 @@ pub struct ProviderPermissionAdmission {
     provider_effect: Option<ProviderEffectResolved>,
     approval_request: Option<contract::ProviderApprovalRequest>,
     mutation_authority: Option<approval::PaidExternalJobMutationAuthority>,
+    notification_request: Option<standing::NotificationRequest>,
+    notification_proof: Option<standing::NotificationReservationProof>,
     attempt: Option<super::ProviderEffectAttempt>,
     recovery: Option<recovery::ProviderRecoveryContext>,
 }
@@ -367,13 +375,38 @@ fn build_provider_admission(
     native_access: Option<ProviderNativeAccess>,
     resolution: Option<&identity::NativeProviderResolution>,
 ) -> Result<EffectAdmission, RuntimeEffectError> {
+    if native_access == Some(ProviderNativeAccess::Mutate)
+        && request
+            .inputs
+            .get("operation")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|operation| operation.trim() == "channel.post")
+        && request
+            .inputs
+            .get("expected_provider")
+            .and_then(JsonValue::as_str)
+            .is_none_or(|provider| provider.trim() != "slack")
+    {
+        return Err(RuntimeEffectError::Denied {
+            family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+            verb: runx_contracts::AuthorityVerb::Write,
+            message: "channel.post requires the Slack provider identity".to_owned(),
+        });
+    }
     let witness = provider_permission_witness(request, &plan);
-    let approval_request = contract::approval_request(request.inputs).map_err(|message| {
-        RuntimeEffectError::InvalidMetadata {
+    let approval_request = contract::approval_request(request.inputs)
+        .map_err(|message| RuntimeEffectError::InvalidMetadata {
             family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
             message,
-        }
-    })?;
+        })?
+        .or_else(|| {
+            mandatory_notification_authorization(request, native_access).then(|| {
+                contract::ProviderApprovalRequest {
+                    reason: "Approve posting this exact Slack notification.".to_owned(),
+                    gate_type: Some("slack_message".to_owned()),
+                }
+            })
+        });
     let provider_effect = native_access
         .zip(resolution)
         .map(|(access, resolved)| {
@@ -396,6 +429,59 @@ fn build_provider_admission(
         request,
         resolution.map(|resolved| resolved.principal_ref.as_str()),
     )?;
+    if mandatory_notification_authorization(request, native_access) && mutation_authority.is_some()
+    {
+        return Err(RuntimeEffectError::Denied {
+            family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+            verb: runx_contracts::AuthorityVerb::Write,
+            message: "Slack channel posts require exact human or bounded notification authority"
+                .to_owned(),
+        });
+    }
+    let notification_request = if mandatory_notification_authorization(request, native_access) {
+        request
+            .env
+            .get(NOTIFICATION_AUTHORITY_ID_ENV)
+            .map(|authority_id| {
+                let target = provider_effect
+                    .as_ref()
+                    .map(|effect| effect.intent().target())
+                    .ok_or_else(|| provider_permission_policy_error("notification effect is missing".to_owned()))?;
+                let payload = request
+                    .inputs
+                    .get("input")
+                    .and_then(JsonValue::as_object)
+                    .ok_or_else(|| provider_permission_policy_error("notification payload is missing".to_owned()))?;
+                if payload.len() != 2
+                    || payload.get("channel_locator").and_then(JsonValue::as_str) != Some(target)
+                    || payload.get("text").and_then(JsonValue::as_str).is_none()
+                {
+                    return Err(provider_permission_policy_error(
+                        "standing notification payload must contain only the exact channel_locator and text".to_owned(),
+                    ));
+                }
+                let source_set_digest = request
+                    .env
+                    .get(NOTIFICATION_SOURCE_SET_DIGEST_ENV)
+                    .cloned()
+                    .unwrap_or_default();
+                let run_id = request
+                    .env
+                    .get(crate::execution::runner::RUNX_RUN_ID_ENV)
+                    .cloned()
+                    .unwrap_or_default();
+                let text = payload.get("text").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
+                Ok(standing::NotificationRequest {
+                    authority_id: authority_id.clone(),
+                    source_set_digest,
+                    run_id,
+                    text,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     Ok(EffectAdmission::new(
         PROVIDER_PERMISSION_EFFECT_FAMILY,
         plan.verb.clone(),
@@ -411,10 +497,24 @@ fn build_provider_admission(
             provider_effect,
             approval_request,
             mutation_authority,
+            notification_request,
+            notification_proof: None,
             attempt: None,
             recovery,
         },
     ))
+}
+
+fn mandatory_notification_authorization(
+    request: &EffectStepRequest<'_>,
+    native_access: Option<ProviderNativeAccess>,
+) -> bool {
+    native_access == Some(ProviderNativeAccess::Mutate)
+        && request
+            .inputs
+            .get("operation")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|operation| operation.trim() == "channel.post")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

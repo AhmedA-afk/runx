@@ -19,6 +19,12 @@ pub mod agent_loop;
 pub mod agent_anthropic;
 
 #[cfg(feature = "agent")]
+pub mod agent_openai;
+
+#[cfg(feature = "agent")]
+pub mod agent_tool_definitions;
+
+#[cfg(feature = "agent")]
 pub mod agent_tools;
 
 #[cfg(feature = "agent")]

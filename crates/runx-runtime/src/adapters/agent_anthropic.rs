@@ -14,6 +14,7 @@ use runx_contracts::JsonValue;
 use serde_json::{Value as WireValue, json};
 
 use super::agent_loop::{AgentToolUse, AgentTurn, ModelCaller, UNRECOGNIZED_MODEL_TOOL};
+use super::agent_tool_definitions::{AgentToolNameMap, wire_tool_name};
 use crate::RuntimeError;
 use crate::credentials::SecretString;
 use crate::http::{HttpMethod, RuntimeHttpHeader, RuntimeHttpRequest, RuntimeHttpTransport};
@@ -28,25 +29,13 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 8192;
 const MANAGED_AGENT_SKILL: &str = "managed-agent";
 
-/// A tool offered to the model: the LLM-facing tool definition the model may
-/// call. Intentionally distinct from `McpToolDescriptor`, which models an MCP
-/// server's protocol listing; they share a shape but sit at different layers. The
-/// resolver builds these from the skill's `allowed_tools` plus the final-result
-/// tool.
-#[derive(Clone, Debug)]
-pub struct AgentToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: JsonValue,
-}
-
 /// Calls the Anthropic Messages API to produce the model's next tool-use requests.
 pub struct AnthropicModelCaller<T> {
     transport: T,
     url: String,
     api_key: SecretString,
     model: String,
-    tools: Vec<AgentToolDefinition>,
+    tools: AgentToolNameMap,
 }
 
 impl<T> AnthropicModelCaller<T> {
@@ -54,7 +43,7 @@ impl<T> AnthropicModelCaller<T> {
         transport: T,
         api_key: SecretString,
         model: String,
-        tools: Vec<AgentToolDefinition>,
+        tools: AgentToolNameMap,
     ) -> Self {
         Self {
             transport,
@@ -74,6 +63,7 @@ impl<T> AnthropicModelCaller<T> {
 
     fn tools_json(&self) -> Vec<WireValue> {
         self.tools
+            .definitions()
             .iter()
             .map(|tool| {
                 json!({
@@ -91,23 +81,9 @@ impl<T> AnthropicModelCaller<T> {
     /// dots flattened; recover the real ref before the governed executor sees it.
     fn real_tool_name(&self, wire: &str) -> String {
         self.tools
-            .iter()
-            .find(|tool| wire_tool_name(&tool.name) == wire)
-            .map_or_else(
-                || UNRECOGNIZED_MODEL_TOOL.to_owned(),
-                |tool| tool.name.clone(),
-            )
+            .real_name(wire)
+            .map_or_else(|| UNRECOGNIZED_MODEL_TOOL.to_owned(), str::to_owned)
     }
-}
-
-/// Flatten a runx tool ref into an Anthropic-admissible tool name. The Messages
-/// API requires tool names to match `^[a-zA-Z0-9_-]{1,128}$`, but runx requires
-/// a dotted namespace (`acme.post`). Dots become underscores on the wire in
-/// every outbound place a tool name appears (the tool list and the replayed
-/// assistant `tool_use` blocks); [`AnthropicModelCaller::real_tool_name`] maps
-/// the model's call back to the dotted ref on the way in.
-fn wire_tool_name(name: &str) -> String {
-    name.replace('.', "_")
 }
 
 /// Convert a runx `JsonValue` to a wire `serde_json::Value`. A plain value never
@@ -254,17 +230,19 @@ mod tests {
         }
     }
 
-    fn caller(stub: &StubTransport) -> AnthropicModelCaller<&StubTransport> {
-        AnthropicModelCaller::new(
+    fn caller(stub: &StubTransport) -> Result<AnthropicModelCaller<&StubTransport>, String> {
+        Ok(AnthropicModelCaller::new(
             stub,
             SecretString::new("key"),
             "claude".to_owned(),
-            vec![AgentToolDefinition {
-                name: "pay".to_owned(),
-                description: "Pay the bounded amount.".to_owned(),
-                input_schema: JsonValue::Object(Default::default()),
-            }],
-        )
+            AgentToolNameMap::new(vec![
+                super::super::agent_tool_definitions::AgentToolDefinition {
+                    name: "pay".to_owned(),
+                    description: "Pay the bounded amount.".to_owned(),
+                    input_schema: JsonValue::Object(Default::default()),
+                },
+            ])?,
+        ))
     }
 
     #[test]
@@ -275,7 +253,7 @@ mod tests {
             status: 200,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("buy a quota".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("buy a quota".to_owned())]);
         assert!(
             matches!(
                 &result,
@@ -315,15 +293,17 @@ mod tests {
             &stub,
             SecretString::new("key"),
             "claude".to_owned(),
-            vec![AgentToolDefinition {
-                name: "acme.post".to_owned(),
-                description: "post".to_owned(),
-                input_schema: {
-                    let mut schema = runx_contracts::JsonObject::new();
-                    schema.insert("type".to_owned(), JsonValue::String("object".to_owned()));
-                    JsonValue::Object(schema)
+            AgentToolNameMap::new(vec![
+                super::super::agent_tool_definitions::AgentToolDefinition {
+                    name: "acme.post".to_owned(),
+                    description: "post".to_owned(),
+                    input_schema: {
+                        let mut schema = runx_contracts::JsonObject::new();
+                        schema.insert("type".to_owned(), JsonValue::String("object".to_owned()));
+                        JsonValue::Object(schema)
+                    },
                 },
-            }],
+            ])?,
         );
         let uses = model
             .next_tool_uses(&[AgentTurn::User("go".to_owned())])
@@ -343,7 +323,7 @@ mod tests {
 
     #[test]
     fn unoffered_wire_tool_name_is_replaced_before_leaving_provider_boundary()
-    -> Result<(), RuntimeError> {
+    -> Result<(), Box<dyn std::error::Error>> {
         const SENSITIVE_MARKER: &str = "customer_secret_as_tool_name";
         let stub = StubTransport {
             body: format!(
@@ -356,11 +336,13 @@ mod tests {
             &stub,
             SecretString::new("key"),
             "claude".to_owned(),
-            vec![AgentToolDefinition {
-                name: "acme.post".to_owned(),
-                description: "post".to_owned(),
-                input_schema: JsonValue::Object(Default::default()),
-            }],
+            AgentToolNameMap::new(vec![
+                super::super::agent_tool_definitions::AgentToolDefinition {
+                    name: "acme.post".to_owned(),
+                    description: "post".to_owned(),
+                    input_schema: JsonValue::Object(Default::default()),
+                },
+            ])?,
         );
 
         let uses = model.next_tool_uses(&[AgentTurn::User("go".to_owned())])?;
@@ -371,63 +353,67 @@ mod tests {
     }
 
     #[test]
-    fn non_success_status_is_an_error() {
+    fn non_success_status_is_an_error() -> Result<(), String> {
         let stub = StubTransport {
             body: "rate limited".to_owned(),
             status: 429,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("go".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("go".to_owned())]);
         assert!(
             matches!(&result, Err(RuntimeError::SkillFailed { message, .. }) if message.contains("429")),
             "non-2xx should be an error; got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn no_tool_use_blocks_yields_empty() {
+    fn no_tool_use_blocks_yields_empty() -> Result<(), String> {
         let stub = StubTransport {
             body: r#"{"content":[{"type":"text","text":"done"}]}"#.to_owned(),
             status: 200,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("go".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("go".to_owned())]);
         assert!(
             matches!(&result, Ok(uses) if uses.is_empty()),
             "no tool_use blocks should yield no uses; got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn malformed_json_body_is_a_parse_error() {
+    fn malformed_json_body_is_a_parse_error() -> Result<(), String> {
         let stub = StubTransport {
             body: "not json at all".to_owned(),
             status: 200,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("go".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("go".to_owned())]);
         assert!(
             result.is_err(),
             "a malformed body must error, not panic; got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn absent_content_yields_empty() {
+    fn absent_content_yields_empty() -> Result<(), String> {
         let stub = StubTransport {
             body: "{}".to_owned(),
             status: 200,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("go".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("go".to_owned())]);
         assert!(
             matches!(&result, Ok(uses) if uses.is_empty()),
             "a response with no content array should yield no uses; got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn tool_use_block_missing_id_or_name_is_skipped() {
+    fn tool_use_block_missing_id_or_name_is_skipped() -> Result<(), String> {
         // One block missing id, one missing name, one well-formed: only the
         // well-formed block survives. A partial block is never half-parsed.
         let stub = StubTransport {
@@ -440,24 +426,26 @@ mod tests {
             status: 200,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("go".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("go".to_owned())]);
         assert!(
             matches!(&result, Ok(uses) if uses.len() == 1 && uses[0].id == "ok" && uses[0].name == "pay"),
             "blocks missing id or name must be skipped; got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn tool_use_missing_input_defaults_to_null() {
+    fn tool_use_missing_input_defaults_to_null() -> Result<(), String> {
         let stub = StubTransport {
             body: r#"{"content":[{"type":"tool_use","id":"t","name":"pay"}]}"#.to_owned(),
             status: 200,
             requests: RefCell::new(Vec::new()),
         };
-        let result = caller(&stub).next_tool_uses(&[AgentTurn::User("go".to_owned())]);
+        let result = caller(&stub)?.next_tool_uses(&[AgentTurn::User("go".to_owned())]);
         assert!(
             matches!(&result, Ok(uses) if uses.len() == 1 && matches!(uses[0].input, JsonValue::Null)),
             "a tool_use with no input defaults to a null input; got: {result:?}"
         );
+        Ok(())
     }
 }

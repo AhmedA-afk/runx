@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,6 +35,149 @@ fn doctor_failure_json_exits_one_and_matches_fixture() -> Result<(), Box<dyn std
         serde_json::from_slice::<serde_json::Value>(&output.stdout)?,
         expected_report(&fixture)?
     );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_explicit_keyless_local_model_and_invalid_endpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = doctor_fixture("empty-success")?;
+    let workspace = fixture.join("workspace");
+    let mut command = runx_command();
+    command
+        .args(["doctor", "--json"])
+        .env("RUNX_CWD", &workspace)
+        .env("RUNX_AGENT_PROVIDER", "openai")
+        .env("RUNX_AGENT_MODEL", "fixture-model")
+        .env("RUNX_AGENT_AUTH_MODE", "local_none")
+        .env(
+            "RUNX_AGENT_ENDPOINT_URL",
+            "http://127.0.0.1:18081/v1/chat/completions",
+        );
+    let output = command.output()?;
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .and_then(|diagnostics| {
+            diagnostics
+                .iter()
+                .find(|item| item["id"] == "runx.agent.config")
+        })
+        .ok_or("missing managed-agent diagnostic")?;
+    assert_eq!(diagnostic["severity"], "info");
+    assert_eq!(diagnostic["evidence"]["auth_mode"], "local_none");
+    assert_eq!(diagnostic["evidence"]["api_key_set"], false);
+
+    command.env(
+        "RUNX_AGENT_ENDPOINT_URL",
+        "http://localhost:18081/v1/chat/completions",
+    );
+    let output = command.output()?;
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .and_then(|diagnostics| {
+            diagnostics
+                .iter()
+                .find(|item| item["id"] == "runx.agent.config")
+        })
+        .ok_or("missing managed-agent diagnostic")?;
+    assert_eq!(diagnostic["severity"], "warning");
+    assert!(
+        diagnostic["evidence"]["semantic_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("agent.endpoint_url"))
+    );
+    Ok(())
+}
+
+#[test]
+fn config_cli_switches_from_local_model_to_anthropic_and_doctor_accepts_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = temp_root("runx-config-provider-switch");
+    fs::create_dir_all(&home)?;
+    let fixture = doctor_fixture("empty-success")?;
+    let workspace = fixture.join("workspace");
+    for (key, value) in [
+        ("agent.provider", "openai"),
+        ("agent.model", "fixture-local"),
+        ("agent.auth_mode", "local_none"),
+        (
+            "agent.endpoint_url",
+            "http://127.0.0.1:18081/v1/chat/completions",
+        ),
+    ] {
+        assert!(
+            runx_command()
+                .args(["config", "set", key, value])
+                .env("RUNX_HOME", &home)
+                .output()?
+                .status
+                .success()
+        );
+    }
+    assert!(
+        runx_command()
+            .args(["config", "unset", "agent.endpoint_url"])
+            .env("RUNX_HOME", &home)
+            .output()?
+            .status
+            .success()
+    );
+    for (key, value) in [
+        ("agent.provider", "anthropic"),
+        ("agent.model", "fixture-claude"),
+        ("agent.auth_mode", "api_key"),
+    ] {
+        assert!(
+            runx_command()
+                .args(["config", "set", key, value])
+                .env("RUNX_HOME", &home)
+                .output()?
+                .status
+                .success()
+        );
+    }
+    let mut set_key = runx_command();
+    let mut child = set_key
+        .args(["config", "set", "agent.api_key", "--from-stdin"])
+        .env("RUNX_HOME", &home)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("missing stdin")?
+        .write_all(b"fixture-secret")?;
+    assert!(child.wait()?.success());
+
+    let config_env =
+        BTreeMap::from([("RUNX_HOME".to_owned(), home.to_string_lossy().into_owned())]);
+    let loaded = runx_runtime::load_managed_agent_config(&config_env, &workspace)?
+        .ok_or("managed configuration should load")?;
+    assert_eq!(loaded.provider.as_str(), "anthropic");
+    assert_eq!(loaded.endpoint_url, None);
+    assert!(loaded.api_key.is_some());
+
+    let doctor = runx_command()
+        .args(["doctor", "--json"])
+        .env("RUNX_HOME", &home)
+        .env("RUNX_CWD", workspace)
+        .output()?;
+    assert!(doctor.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+    let diagnostic = report["diagnostics"]
+        .as_array()
+        .ok_or("missing diagnostics")?
+        .iter()
+        .find(|item| item["id"] == "runx.agent.config")
+        .ok_or("missing managed-agent diagnostic")?;
+    assert_eq!(diagnostic["severity"], "info");
+    assert_eq!(diagnostic["evidence"]["endpoint_set"], false);
+    assert_eq!(diagnostic["evidence"]["auth_mode"], "api_key");
+    fs::remove_dir_all(home)?;
     Ok(())
 }
 

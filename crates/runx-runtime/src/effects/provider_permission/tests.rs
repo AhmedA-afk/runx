@@ -248,6 +248,8 @@ fn local_github_mutation_recovery_preserves_stable_idempotency_and_readback() {
             gate_type: Some("test_mutation".to_owned()),
         }),
         mutation_authority: None,
+        notification_request: None,
+        notification_proof: None,
         attempt: Some(first_attempt.clone()),
         recovery: Some(first_recovery),
     };

@@ -156,13 +156,14 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "config",
         top_level_usage: &[
-            "runx config set|get|list [provider|model|api-key|public-token] [value] [-j|--json]",
+            "runx config set|get|list|unset [provider|model|api-key|public-token|endpoint-url] [value] [-j|--json]",
         ],
         usage: &[
             "runx config set <key> <value> [-j|--json]",
             "runx config set api-key|public-token --from-stdin [-j|--json]",
             "runx config get <key> [-j|--json]",
             "runx config list [-j|--json]",
+            "runx config unset endpoint-url [-j|--json]",
         ],
         notes: &[
             "Short keys: provider, model, api-key, and public-token. Fully qualified config keys are also accepted. Secret values are accepted only on stdin.",
@@ -190,6 +191,23 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
             "--provider provider",
             "--skill skill",
             "--credential name",
+            "-j, --json",
+        ],
+    },
+    CommandSpec {
+        name: "assistant",
+        top_level_usage: &[
+            "runx assistant check|tick|status|report|pause|resume|grant|revoke|discard-notification|install-timer|remove-timer|work|memories|remember|forget --profile path [-j|--json]",
+        ],
+        usage: &["runx assistant <action> --profile path [-j|--json]"],
+        notes: &[
+            "Runs a bounded local personal assistant from a private, operator-owned profile. Scheduled ticks use configured standing permissions and never prompt for action approval.",
+        ],
+        options: &[
+            "--profile path  Exact private assistant profile",
+            "--memory-id id  Stable confirmed-memory identifier for remember/forget",
+            "--text-file path  Private UTF-8 memory text for remember",
+            "--cursor value  Continue one bounded work-queue page",
             "-j, --json",
         ],
     },

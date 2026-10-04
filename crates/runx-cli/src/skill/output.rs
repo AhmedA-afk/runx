@@ -410,7 +410,7 @@ fn append_artifact_refs(object: &mut JsonObject, refs: Vec<JsonValue>) {
     }
 }
 
-fn persist_json_artifact(
+pub(crate) fn persist_json_artifact(
     project_runx_dir: &Path,
     run_id: &str,
     kind: &str,
@@ -420,21 +420,37 @@ fn persist_json_artifact(
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     let digest = sha256_prefixed(&bytes);
     let digest_label = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let directory = project_runx_dir
-        .join("artifacts")
-        .join("skill-runs")
-        .join(safe_path_segment(run_id))
-        .join(kind);
+    let artifact_root = project_runx_dir.join("artifacts");
+    let skill_runs = artifact_root.join("skill-runs");
+    let run_directory = skill_runs.join(safe_path_segment(run_id));
+    let directory = run_directory.join(kind);
     fs::create_dir_all(&directory)
         .map_err(|error| format!("creating {}: {error}", directory.display()))?;
+    // Protect the whole subtree before writing any result or temporary file.
+    restrict_artifact_directory(&artifact_root)?;
+    restrict_artifact_directory(&skill_runs)?;
+    restrict_artifact_directory(&run_directory)?;
+    restrict_artifact_directory(&directory)?;
     let path = directory.join(format!(
         "{}-{}.json",
         safe_path_segment(label),
         digest_label
     ));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(format!(
+                "artifact target {} is not a regular file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("checking {}: {error}", path.display())),
+    }
     if !path.exists() {
         write_atomic(&path, &bytes)?;
     }
+    restrict_artifact_file(&path)?;
     Ok(JsonValue::Object(JsonObject::from([
         (
             "schema".to_owned(),
@@ -458,6 +474,68 @@ fn persist_json_artifact(
             JsonValue::String(path.to_string_lossy().into_owned()),
         ),
     ])))
+}
+
+pub(crate) fn read_json_artifact(
+    project_runx_dir: &Path,
+    reference: &JsonValue,
+) -> Result<JsonValue, String> {
+    let field = |name| reference.as_object().and_then(|object| object.get(name));
+    if field("schema").and_then(JsonValue::as_str) != Some("runx.project_artifact_ref.v1") {
+        return Err("assistant intent artifact reference has an unsupported schema".to_owned());
+    }
+    let raw_path = field("path")
+        .and_then(JsonValue::as_str)
+        .ok_or("assistant intent artifact lacks a path")?;
+    let path = Path::new(raw_path)
+        .canonicalize()
+        .map_err(|error| format!("resolving assistant intent artifact: {error}"))?;
+    let root = project_runx_dir
+        .join("artifacts")
+        .canonicalize()
+        .map_err(|error| format!("resolving assistant artifact root: {error}"))?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return Err("assistant intent artifact escapes the project artifact root".to_owned());
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| format!("reading assistant intent artifact: {error}"))?;
+    if bytes.len() > 128 * 1024 {
+        return Err("assistant intent artifact exceeds 128 KiB".to_owned());
+    }
+    let digest = sha256_prefixed(&bytes);
+    if field("digest").and_then(JsonValue::as_str) != Some(digest.as_str()) {
+        return Err(
+            "assistant intent artifact digest differs from the stored reference".to_owned(),
+        );
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("assistant intent artifact is invalid JSON: {error}"))
+}
+
+#[cfg(unix)]
+fn restrict_artifact_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("restricting {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_artifact_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_artifact_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("restricting {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_artifact_file(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -712,15 +790,119 @@ fn object_string<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
     use std::process::ExitCode;
 
     use runx_contracts::{JsonObject, JsonValue};
 
     use super::{
-        ResumeHint, closure_disposition_exit_code, run_result_exit_code, serialize_json_output,
-        write_skill_text,
+        ResumeHint, closure_disposition_exit_code, persist_json_artifact, read_json_artifact,
+        run_result_exit_code, serialize_json_output, write_skill_text,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn project_artifacts_are_private_and_existing_artifacts_are_restricted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let workspace = std::env::temp_dir().join(format!(
+            "runx-artifact-permission-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&workspace)?;
+        let runx_dir = workspace.join(".runx");
+        let reference = persist_json_artifact(
+            &runx_dir,
+            "run_private",
+            "results",
+            "result",
+            &JsonValue::String("private message preview".to_owned()),
+        )?;
+        let path = reference
+            .as_object()
+            .and_then(|value| value.get("path"))
+            .and_then(JsonValue::as_str)
+            .ok_or("artifact has no path")?;
+        let path = Path::new(path);
+        for directory in [
+            runx_dir.join("artifacts"),
+            runx_dir.join("artifacts/skill-runs"),
+            runx_dir.join("artifacts/skill-runs/run_private"),
+            runx_dir.join("artifacts/skill-runs/run_private/results"),
+        ] {
+            assert_eq!(fs::metadata(directory)?.permissions().mode() & 0o777, 0o700);
+        }
+        assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+
+        fs::set_permissions(
+            runx_dir.join("artifacts"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+        persist_json_artifact(
+            &runx_dir,
+            "run_private",
+            "results",
+            "result",
+            &JsonValue::String("private message preview".to_owned()),
+        )?;
+        assert_eq!(
+            fs::metadata(runx_dir.join("artifacts"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_intent_artifact_refuses_tampering_and_path_escape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = std::env::temp_dir().join(format!(
+            "runx-exact-intent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir(&workspace)?;
+        let runx_dir = workspace.join(".runx");
+        let exact = JsonValue::String("exact private update".to_owned());
+        let reference =
+            persist_json_artifact(&runx_dir, "assistant", "assistant", "intent", &exact)?;
+        assert_eq!(read_json_artifact(&runx_dir, &reference)?, exact);
+        let path = reference
+            .as_object()
+            .and_then(|item| item.get("path"))
+            .and_then(JsonValue::as_str)
+            .ok_or("artifact has no path")?;
+        fs::write(path, b"\"changed\"")?;
+        assert!(read_json_artifact(&runx_dir, &reference).is_err());
+        let mut escaped = reference.clone();
+        let JsonValue::Object(ref mut fields) = escaped else {
+            unreachable!()
+        };
+        fields.insert(
+            "path".to_owned(),
+            JsonValue::String(
+                workspace
+                    .join("outside.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        fs::write(workspace.join("outside.json"), b"\"exact private update\"")?;
+        assert!(read_json_artifact(&runx_dir, &escaped).is_err());
+        fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
 
     #[test]
     fn json_output_is_compact_and_omits_diagnostic_context()

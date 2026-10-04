@@ -22,7 +22,7 @@
 // one cohesive unit; splitting them would scatter the single source of truth for
 // the tool-use protocol.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use runx_contracts::{JsonValue, OutputField, validate_output_value};
 
@@ -179,7 +179,7 @@ fn next_tool_uses_resilient<M>(
     model_calls: &mut u32,
 ) -> Result<Vec<AgentToolUse>, AgentLoopFailureReason>
 where
-    M: ModelCaller,
+    M: ModelCaller + ?Sized,
 {
     for _ in 0..=max_resamples {
         *model_calls = model_calls.saturating_add(1);
@@ -222,7 +222,7 @@ pub fn run_agent_loop<M, T>(
     prompt: String,
 ) -> Result<AgentResolution, AgentLoopFailure>
 where
-    M: ModelCaller,
+    M: ModelCaller + ?Sized,
     T: ToolExecutor,
 {
     let mut transcript = vec![AgentTurn::User(prompt)];
@@ -233,6 +233,7 @@ where
     // The real result of the last successful governed tool call, captured from the
     // tool output so a domain receipt records the effect, not the model's retelling.
     let mut last_effect: Option<JsonValue> = None;
+    let mut seen_tool_call_ids = BTreeSet::new();
 
     for round in 1..=config.max_rounds {
         let uses = match next_tool_uses_resilient(
@@ -267,10 +268,60 @@ where
                 ));
             }
         };
+        let mut round_ids = BTreeSet::new();
+        let invalid_call = uses.iter().any(|use_| {
+            use_.id.trim().is_empty()
+                || !matches!(&use_.input, JsonValue::Object(_))
+                || !round_ids.insert(use_.id.as_str())
+                || seen_tool_call_ids.contains(&use_.id)
+        });
+        if invalid_call
+            || (uses.len() > 1
+                && uses
+                    .iter()
+                    .any(|use_| use_.name == config.final_result_tool))
+        {
+            return Err(AgentLoopFailure::new(
+                AgentLoopFailureReason::ToolExecutionFailed,
+                "Managed agent emitted an invalid tool-call batch.",
+                failure_telemetry(round, model_calls, tool_calls, tools, tool_executions),
+            ));
+        }
+        // Admit the entire model batch before executing any tool. A late
+        // unknown name must not leave earlier calls with partial effects.
+        let admitted_names = uses
+            .iter()
+            .map(|use_| {
+                if use_.name == config.final_result_tool {
+                    Some(config.final_result_tool.clone())
+                } else {
+                    executor.admitted_tool_name(&use_.name)
+                }
+            })
+            .collect::<Vec<_>>();
+        if admitted_names.iter().any(Option::is_none) {
+            tool_calls = tool_calls.saturating_add(1);
+            if !tools.iter().any(|name| name == UNRECOGNIZED_MODEL_TOOL) {
+                tools.push(UNRECOGNIZED_MODEL_TOOL.to_owned());
+            }
+            tool_executions.push(AgentToolExecutionTrace {
+                tool: UNRECOGNIZED_MODEL_TOOL.to_owned(),
+                status: "failure".to_owned(),
+                receipt_id: None,
+                resolution_kind: None,
+            });
+            return Err(AgentLoopFailure::new(
+                AgentLoopFailureReason::ToolExecutionFailed,
+                "Managed agent tool execution failed.",
+                failure_telemetry(round, model_calls, tool_calls, tools, tool_executions),
+            ));
+        }
+        let admitted_names = admitted_names.into_iter().flatten();
+        seen_tool_call_ids.extend(round_ids.into_iter().map(str::to_owned));
         transcript.push(AgentTurn::AssistantToolUses(uses.clone()));
 
         let mut results = Vec::with_capacity(uses.len());
-        for use_ in &uses {
+        for (use_, admitted_name) in uses.iter().zip(admitted_names) {
             if use_.name == config.final_result_tool {
                 if let Err(error) = validate_final_result(config, &use_.input) {
                     tool_executions.push(AgentToolExecutionTrace {
@@ -304,22 +355,7 @@ where
             }
 
             tool_calls = tool_calls.saturating_add(1);
-            let Some(tool_name) = executor.admitted_tool_name(&use_.name) else {
-                if !tools.iter().any(|name| name == UNRECOGNIZED_MODEL_TOOL) {
-                    tools.push(UNRECOGNIZED_MODEL_TOOL.to_owned());
-                }
-                tool_executions.push(AgentToolExecutionTrace {
-                    tool: UNRECOGNIZED_MODEL_TOOL.to_owned(),
-                    status: "failure".to_owned(),
-                    receipt_id: None,
-                    resolution_kind: None,
-                });
-                return Err(AgentLoopFailure::new(
-                    AgentLoopFailureReason::ToolExecutionFailed,
-                    "Managed agent tool execution failed.",
-                    failure_telemetry(round, model_calls, tool_calls, tools, tool_executions),
-                ));
-            };
+            let tool_name = admitted_name;
             if !tools.iter().any(|name| name == &tool_name) {
                 tools.push(tool_name.clone());
             }
@@ -405,6 +441,8 @@ fn validate_final_result(config: &AgentLoopConfig, value: &JsonValue) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::adapter::InvocationOutput;
     use runx_contracts::{JsonObject, JsonValue, OutputField, OutputType};
@@ -422,6 +460,86 @@ mod tests {
             "status".to_owned(),
             JsonValue::String("done".to_owned()),
         )]))
+    }
+
+    struct OneBatch(Vec<AgentToolUse>);
+
+    impl ModelCaller for OneBatch {
+        fn next_tool_uses(
+            &self,
+            _transcript: &[AgentTurn],
+        ) -> Result<Vec<AgentToolUse>, RuntimeError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct CountingExecutor(Cell<u32>);
+
+    impl ToolExecutor for CountingExecutor {
+        fn admitted_tool_name(&self, tool: &str) -> Option<String> {
+            (tool == "noop").then(|| tool.to_owned())
+        }
+
+        fn execute(
+            &self,
+            _tool: &str,
+            _input: &JsonValue,
+        ) -> Result<InvocationOutput, RuntimeError> {
+            self.0.set(self.0.get() + 1);
+            Ok(skill_output("ok"))
+        }
+    }
+
+    #[test]
+    fn malformed_and_duplicate_call_batches_never_execute_any_tool() -> Result<(), String> {
+        let valid = AgentToolUse {
+            id: "call-1".to_owned(),
+            name: "noop".to_owned(),
+            input: JsonValue::Object(Default::default()),
+        };
+        let config = AgentLoopConfig {
+            max_rounds: 2,
+            max_empty_turn_resamples: 0,
+            final_result_tool: FINAL.to_owned(),
+            final_result_output: None,
+            final_result_schema: None,
+        };
+        let cases = [
+            vec![valid.clone(), valid.clone()],
+            vec![AgentToolUse {
+                input: JsonValue::Null,
+                ..valid.clone()
+            }],
+            vec![AgentToolUse {
+                id: String::new(),
+                ..valid.clone()
+            }],
+            vec![
+                valid.clone(),
+                AgentToolUse {
+                    id: "final".to_owned(),
+                    name: FINAL.to_owned(),
+                    input: done_payload(),
+                },
+            ],
+            vec![
+                valid,
+                AgentToolUse {
+                    id: "unknown".to_owned(),
+                    name: UNRECOGNIZED_MODEL_TOOL.to_owned(),
+                    input: JsonValue::Object(Default::default()),
+                },
+            ],
+        ];
+        for calls in cases {
+            let executor = CountingExecutor(Cell::new(0));
+            let error = run_agent_loop(&config, &OneBatch(calls), &executor, "go".to_owned())
+                .err()
+                .ok_or_else(|| "invalid batch must be refused".to_owned())?;
+            assert_eq!(error.reason(), AgentLoopFailureReason::ToolExecutionFailed);
+            assert_eq!(executor.0.get(), 0);
+        }
+        Ok(())
     }
 
     struct OkExecutor;
@@ -460,7 +578,7 @@ mod tests {
                 Ok(vec![AgentToolUse {
                     id: "t1".to_owned(),
                     name: "pay".to_owned(),
-                    input: JsonValue::Null,
+                    input: JsonValue::Object(Default::default()),
                 }])
             }
         }
@@ -586,9 +704,9 @@ mod tests {
                 _transcript: &[AgentTurn],
             ) -> Result<Vec<AgentToolUse>, RuntimeError> {
                 Ok(vec![AgentToolUse {
-                    id: "x".to_owned(),
+                    id: format!("x{}", _transcript.len()),
                     name: "noop".to_owned(),
-                    input: JsonValue::Null,
+                    input: JsonValue::Object(Default::default()),
                 }])
             }
         }
@@ -680,7 +798,7 @@ mod tests {
                     Ok(vec![AgentToolUse {
                         id: "t1".to_owned(),
                         name: "pay".to_owned(),
-                        input: JsonValue::Null,
+                        input: JsonValue::Object(Default::default()),
                     }])
                 }
             }
@@ -830,7 +948,7 @@ mod tests {
                 Ok(vec![AgentToolUse {
                     id: "unknown".to_owned(),
                     name: SENSITIVE_MARKER.to_owned(),
-                    input: JsonValue::Null,
+                    input: JsonValue::Object(Default::default()),
                 }])
             }
         }
@@ -952,7 +1070,7 @@ mod tests {
             let input = if name == FINAL {
                 done_payload()
             } else {
-                JsonValue::Null
+                JsonValue::Object(Default::default())
             };
             Ok(vec![AgentToolUse {
                 id: format!("c{executed}"),

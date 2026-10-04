@@ -13,8 +13,8 @@ use runx_runtime::{
     PROVIDER_PERMISSION_PRINCIPAL_REF_ENV, RUNX_RECEIPT_SIGN_ED25519_SEED_BASE64_ENV,
     RUNX_RECEIPT_SIGN_ISSUER_TYPE_ENV, RUNX_RECEIPT_SIGN_KID_ENV, RuntimeError,
     RuntimeReceiptSignatureConfig, RuntimeReceiptVerifierSource, WorkspaceEnv,
-    decode_provider_scopes_env, default_doctor_options, load_runx_config_file,
-    receipt_verifier_from_env, resolve_runx_home_dir, run_doctor,
+    decode_provider_scopes_env, default_doctor_options, load_managed_agent_config,
+    load_runx_config_file, receipt_verifier_from_env, resolve_runx_home_dir, run_doctor,
 };
 
 use crate::registry::{self, RegistryAction, RegistryPlan};
@@ -102,7 +102,14 @@ fn managed_agent_config_diagnostic(
         JsonValue::String(config_path.display().to_string()),
     );
 
-    let (config_provider, config_model, config_key_ref, config_error) = match config {
+    let (
+        config_provider,
+        config_model,
+        config_key_ref,
+        config_endpoint,
+        config_auth_mode,
+        config_error,
+    ) = match config {
         Ok(config) => (
             config
                 .agent
@@ -119,9 +126,17 @@ fn managed_agent_config_diagnostic(
                 .as_ref()
                 .and_then(|agent| agent.api_key_ref.as_deref())
                 .map(str::to_owned),
+            config
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.endpoint_url.clone()),
+            config
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.auth_mode.clone()),
             None,
         ),
-        Err(error) => (None, None, None, Some(error.to_string())),
+        Err(error) => (None, None, None, None, None, Some(error.to_string())),
     };
 
     let provider = first_non_empty([
@@ -131,6 +146,14 @@ fn managed_agent_config_diagnostic(
     let model = first_non_empty([
         env.get("RUNX_AGENT_MODEL").map(String::as_str),
         config_model.as_deref(),
+    ]);
+    let endpoint = first_non_empty([
+        env.get("RUNX_AGENT_ENDPOINT_URL").map(String::as_str),
+        config_endpoint.as_deref(),
+    ]);
+    let auth_mode = first_non_empty([
+        env.get("RUNX_AGENT_AUTH_MODE").map(String::as_str),
+        config_auth_mode.as_deref(),
     ]);
     let provider_key_env = provider.and_then(provider_api_key_env);
     let api_key_configured = env_contains_non_empty(env, "RUNX_AGENT_API_KEY")
@@ -144,6 +167,23 @@ fn managed_agent_config_diagnostic(
         JsonValue::Bool(provider.is_some()),
     );
     evidence.insert("model_set".to_owned(), JsonValue::Bool(model.is_some()));
+    evidence.insert(
+        "endpoint_set".to_owned(),
+        JsonValue::Bool(endpoint.is_some()),
+    );
+    if let Some(auth_mode) = auth_mode {
+        evidence.insert(
+            "auth_mode".to_owned(),
+            JsonValue::String(
+                if matches!(auth_mode, "api_key" | "local_none") {
+                    auth_mode
+                } else {
+                    "[invalid]"
+                }
+                .to_owned(),
+            ),
+        );
+    }
     evidence.insert(
         "api_key_set".to_owned(),
         JsonValue::Bool(api_key_configured),
@@ -167,9 +207,30 @@ fn managed_agent_config_diagnostic(
         evidence.insert("config_error".to_owned(), JsonValue::String(error.clone()));
     }
 
-    let complete = provider.is_some() && model.is_some() && api_key_configured;
+    let semantic_result = (config_error.is_none()).then(|| load_managed_agent_config(env, cwd));
+    let semantic_error = semantic_result
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(ToString::to_string);
+    if let Some(error) = semantic_error.as_ref() {
+        evidence.insert(
+            "semantic_error".to_owned(),
+            JsonValue::String(error.clone()),
+        );
+    }
+    let provider_supported = provider.is_some_and(|value| matches!(value, "anthropic" | "openai"));
+    let complete = provider_supported
+        && semantic_result
+            .as_ref()
+            .is_some_and(|result| matches!(result, Ok(Some(_))));
     let partial = !complete
-        && (provider.is_some() || model.is_some() || api_key_configured || config_error.is_some());
+        && (provider.is_some()
+            || model.is_some()
+            || api_key_configured
+            || endpoint.is_some()
+            || auth_mode.is_some()
+            || config_error.is_some()
+            || semantic_error.is_some());
     if !complete && !partial {
         return None;
     }
@@ -180,10 +241,12 @@ fn managed_agent_config_diagnostic(
     };
     let message = if let Some(error) = config_error {
         format!("Managed-agent config could not be read: {error}.")
+    } else if let Some(error) = semantic_error {
+        format!("Managed-agent config is invalid: {error}.")
     } else if complete {
         "Managed-agent config is complete; agent-task runners can execute in-process.".to_owned()
     } else {
-        "Managed-agent config is partial; set provider, model, and API key or unset the partial values. Otherwise agent-task runners may yield to the host or fail later.".to_owned()
+        "Managed-agent config is partial; set provider, model, and API key, or select local_none with an exact loopback endpoint. Otherwise agent-task runners may yield to the host or fail later.".to_owned()
     };
 
     Some(DoctorDiagnostic {
@@ -210,12 +273,12 @@ fn managed_agent_config_diagnostic(
                 path: Some("runx config".to_owned()),
                 json_pointer: Some("/agent".to_owned()),
                 contents: Some(
-                    "Set agent.provider, agent.model, and agent.api_key, or unset partial managed-agent config."
+                    "Set agent.provider, agent.model, and agent.api_key; or set agent.auth_mode local_none and an exact loopback agent.endpoint_url. Clear a local endpoint with runx config unset agent.endpoint_url before switching to Anthropic. Correct other invalid settings through runx config set."
                         .to_owned(),
                 ),
                 patch: None,
                 command: Some(
-                    "runx config set agent.provider anthropic && runx config set agent.model <model> && printf '%s' \"$ANTHROPIC_API_KEY\" | runx config set agent.api_key --from-stdin".to_owned(),
+                    "runx config unset agent.endpoint_url && runx config set agent.auth_mode api_key && runx config set agent.provider anthropic && runx config set agent.model <model> && printf '%s' \"$ANTHROPIC_API_KEY\" | runx config set agent.api_key --from-stdin".to_owned(),
                 ),
                 requires_human_review: false,
             }]

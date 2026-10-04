@@ -343,6 +343,13 @@
     "catalog_role": "canonical"
   },
   {
+    "skill_id": "runx/personal-assistant",
+    "version": "sha-790c961d542f",
+    "digest": "0aaf03c705354ae76ea55490ea8230bf0d71a132a575105c0868a0952c55f511",
+    "catalog_visibility": "public",
+    "catalog_role": "context"
+  },
+  {
     "skill_id": "runx/policy-author",
     "version": "sha-05f7413a8ac1",
     "digest": "9c5da4bc2950eeb8b8b060a920021671272b9232d3c265f878620ffa0d1d6c6c",
@@ -470,8 +477,8 @@
   },
   {
     "skill_id": "runx/slack-notify",
-    "version": "sha-2ace480bf3c5",
-    "digest": "50fcca88e86bd713474696ded4803910328fc17727ef73937463af00b8586023",
+    "version": "sha-fbd57640f7a0",
+    "digest": "12939423eca57e758c5530505afd8be5d89e0eb03f5807da5b6b2686a43e9459",
     "catalog_visibility": "public",
     "catalog_role": "branded"
   },

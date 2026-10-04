@@ -88,9 +88,23 @@ export function finalizeNotification(inputs) {
     }
   }
 
+  return { notify_plan: notificationPacket(context, sendPlan, findings) };
+}
+
+export function finalizeExactNotification(inputs) {
+  const context = object(inputs.slack_context);
+  const findings = Array.isArray(context.findings) ? [...context.findings] : [];
+  const sendPlan = {
+    decision: context.decision === "ready" && findings.length === 0 ? "ready" : "needs_input",
+    origin: "slack-notify.exact",
+    authority: "native_delivery_gate",
+  };
+  return { notify_plan: notificationPacket(context, sendPlan, findings) };
+}
+
+function notificationPacket(context, sendPlan, findings) {
   const ready = context.decision === "ready" && findings.length === 0;
   return {
-    notify_plan: {
       schema: "runx.notify.v1",
       decision: ready ? "ready_for_provider" : "blocked",
       provider: "slack",
@@ -107,8 +121,7 @@ export function finalizeNotification(inputs) {
         state: "ready_for_approval",
       } : {},
       validation: { status: ready ? "pass" : "fail", findings },
-    },
-  };
+    };
 }
 
 function isDigest(value) {

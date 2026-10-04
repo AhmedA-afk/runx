@@ -56,6 +56,10 @@ pub struct RunxAgentConfig {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +87,8 @@ pub enum ConfigKey {
     AgentProvider,
     AgentModel,
     AgentApiKey,
+    AgentEndpointUrl,
+    AgentAuthMode,
     PublicApiToken,
 }
 
@@ -102,7 +108,48 @@ pub struct ManagedAgentConfig {
     /// non-empty string is accepted; new providers do not need a code edit.
     pub provider: NonEmptyString,
     pub model: String,
-    pub api_key: SecretString,
+    pub api_key: Option<SecretString>,
+    pub endpoint_url: Option<String>,
+    pub auth_mode: ManagedAgentAuthMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedAgentAuthMode {
+    ApiKey,
+    LocalNone,
+}
+
+impl ManagedAgentAuthMode {
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value.trim() {
+            "api_key" => Ok(Self::ApiKey),
+            "local_none" => Ok(Self::LocalNone),
+            _ => Err(ConfigError::InvalidAgentSetting {
+                key: "agent.auth_mode",
+                message: "expected api_key or local_none",
+            }),
+        }
+    }
+}
+
+fn validate_agent_endpoint_syntax(value: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(value).map_err(|_| ConfigError::InvalidAgentSetting {
+        key: "agent.endpoint_url",
+        message: "expected an absolute HTTP or HTTPS URL",
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidAgentSetting {
+            key: "agent.endpoint_url",
+            message: "expected an HTTP or HTTPS URL without credentials, query or fragment",
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -113,6 +160,11 @@ pub enum ConfigError {
     NonObjectJson { path: PathBuf },
     #[error("unsupported runx config key {key}")]
     UnsupportedKey { key: String },
+    #[error("invalid {key}: {message}")]
+    InvalidAgentSetting {
+        key: &'static str,
+        message: &'static str,
+    },
     #[error("runx local agent key corrupted or unreadable at {path}{suffix}")]
     LocalAgentKeyCorrupt { path: PathBuf, suffix: String },
     #[error("config crypto failed: {0}")]
@@ -126,6 +178,8 @@ pub fn parse_config_key(key: &str) -> Result<ConfigKey, ConfigError> {
         "agent.provider" => Ok(ConfigKey::AgentProvider),
         "agent.model" => Ok(ConfigKey::AgentModel),
         "agent.api_key" => Ok(ConfigKey::AgentApiKey),
+        "agent.endpoint_url" => Ok(ConfigKey::AgentEndpointUrl),
+        "agent.auth_mode" => Ok(ConfigKey::AgentAuthMode),
         "public.api_token" => Ok(ConfigKey::PublicApiToken),
         _ => Err(ConfigError::UnsupportedKey {
             key: key.to_owned(),
@@ -227,6 +281,18 @@ pub fn update_runx_config_value(
             agent.api_key_ref = Some(store_local_agent_api_key(config_dir, value)?);
             config.agent = Some(agent);
         }
+        ConfigKey::AgentEndpointUrl => {
+            validate_agent_endpoint_syntax(value)?;
+            let mut agent = config.agent.unwrap_or_default();
+            agent.endpoint_url = Some(value.to_owned());
+            config.agent = Some(agent);
+        }
+        ConfigKey::AgentAuthMode => {
+            ManagedAgentAuthMode::parse(value)?;
+            let mut agent = config.agent.unwrap_or_default();
+            agent.auth_mode = Some(value.to_owned());
+            config.agent = Some(agent);
+        }
         ConfigKey::PublicApiToken => {
             let mut public = config.public.unwrap_or_default();
             public.api_token_ref = Some(store_local_public_api_token(config_dir, value)?);
@@ -236,10 +302,19 @@ pub fn update_runx_config_value(
     Ok(config)
 }
 
+pub fn clear_runx_agent_endpoint_url(mut config: RunxConfigFile) -> RunxConfigFile {
+    if let Some(agent) = config.agent.as_mut() {
+        agent.endpoint_url = None;
+    }
+    config
+}
+
 pub fn lookup_runx_config_value(config: &RunxConfigFile, key: ConfigKey) -> Option<String> {
     match key {
         ConfigKey::AgentProvider => config.agent.as_ref()?.provider.clone(),
         ConfigKey::AgentModel => config.agent.as_ref()?.model.clone(),
+        ConfigKey::AgentEndpointUrl => config.agent.as_ref()?.endpoint_url.clone(),
+        ConfigKey::AgentAuthMode => config.agent.as_ref()?.auth_mode.clone(),
         ConfigKey::AgentApiKey => config
             .agent
             .as_ref()?
@@ -346,6 +421,30 @@ pub fn load_managed_agent_config(
 ) -> Result<Option<ManagedAgentConfig>, ConfigError> {
     let config_dir = resolve_runx_home_dir(env, cwd);
     let config = load_runx_config_file(&config_dir.join("config.json"))?;
+    let auth_mode = env
+        .get("RUNX_AGENT_AUTH_MODE")
+        .or_else(|| {
+            config
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.auth_mode.as_ref())
+        })
+        .map_or(Ok(ManagedAgentAuthMode::ApiKey), |value| {
+            ManagedAgentAuthMode::parse(value)
+        })?;
+    let endpoint_url = env
+        .get("RUNX_AGENT_ENDPOINT_URL")
+        .or_else(|| {
+            config
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.endpoint_url.as_ref())
+        })
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if let Some(endpoint) = endpoint_url.as_deref() {
+        validate_agent_endpoint_syntax(endpoint)?;
+    }
     let provider = env
         .get("RUNX_AGENT_PROVIDER")
         .or_else(|| {
@@ -356,6 +455,12 @@ pub fn load_managed_agent_config(
         })
         .and_then(|value| normalize_managed_agent_provider(value));
     let Some(provider) = provider else {
+        if auth_mode == ManagedAgentAuthMode::LocalNone {
+            return Err(ConfigError::InvalidAgentSetting {
+                key: "agent.provider",
+                message: "local_none requires the openai provider",
+            });
+        }
         return Ok(None);
     };
     let model = env
@@ -364,6 +469,12 @@ pub fn load_managed_agent_config(
         .map(|value| value.trim().to_owned())
         .unwrap_or_default();
     if model.is_empty() {
+        if auth_mode == ManagedAgentAuthMode::LocalNone {
+            return Err(ConfigError::InvalidAgentSetting {
+                key: "agent.model",
+                message: "local_none requires a model",
+            });
+        }
         return Ok(None);
     }
     let provider_env_var = managed_agent_provider_env_var(&provider);
@@ -373,7 +484,8 @@ pub fn load_managed_agent_config(
         .or(provider_key)
         .map(|value| value.trim().to_owned())
         .unwrap_or_default();
-    if api_key.is_empty()
+    if auth_mode == ManagedAgentAuthMode::ApiKey
+        && api_key.is_empty()
         && let Some(key_ref) = config
             .agent
             .as_ref()
@@ -384,13 +496,48 @@ pub fn load_managed_agent_config(
             .trim()
             .to_owned();
     }
-    if api_key.is_empty() {
-        return Ok(None);
+    match auth_mode {
+        ManagedAgentAuthMode::ApiKey => {
+            if let Some(endpoint) = endpoint_url.as_deref()
+                && (provider.as_str() != managed_agent_provider::OPENAI
+                    || !endpoint.starts_with("https://"))
+            {
+                return Err(ConfigError::InvalidAgentSetting {
+                    key: "agent.endpoint_url",
+                    message: "api_key endpoints require the openai provider and HTTPS",
+                });
+            }
+            if api_key.is_empty() {
+                return Ok(None);
+            }
+        }
+        ManagedAgentAuthMode::LocalNone => {
+            if provider.as_str() != managed_agent_provider::OPENAI || !api_key.is_empty() {
+                return Err(ConfigError::InvalidAgentSetting {
+                    key: "agent.auth_mode",
+                    message: "local_none requires openai and no API key",
+                });
+            }
+            let Some(endpoint) = endpoint_url.as_deref() else {
+                return Err(ConfigError::InvalidAgentSetting {
+                    key: "agent.endpoint_url",
+                    message: "local_none requires an explicit loopback endpoint",
+                });
+            };
+            crate::http::validate_exact_loopback_agent_endpoint(endpoint).map_err(|_| {
+                ConfigError::InvalidAgentSetting {
+                    key: "agent.endpoint_url",
+                    message: "local_none requires a literal loopback chat-completions URL",
+                }
+            })?;
+        }
     }
     Ok(Some(ManagedAgentConfig {
         provider,
         model,
-        api_key: SecretString::new(api_key),
+        api_key: (!api_key.is_empty()).then(|| SecretString::new(api_key)),
+        endpoint_url,
+        auth_mode,
     }))
 }
 

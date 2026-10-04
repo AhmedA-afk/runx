@@ -3,11 +3,11 @@ use std::fs;
 use std::path::Path;
 
 use runx_runtime::{
-    ConfigError, ConfigKey, ManagedAgentConfig, RunxAgentConfig, RunxConfigFile, SecretString,
-    load_local_agent_api_key, load_local_public_api_token, load_managed_agent_config,
-    load_runx_config_file, lookup_runx_config_value, managed_agent_provider, mask_runx_config_file,
-    resolve_runx_global_home_dir, resolve_runx_workspace_base, update_runx_config_value,
-    write_runx_config_file,
+    ConfigError, ConfigKey, ManagedAgentAuthMode, ManagedAgentConfig, RunxAgentConfig,
+    RunxConfigFile, SecretString, load_local_agent_api_key, load_local_public_api_token,
+    load_managed_agent_config, load_runx_config_file, lookup_runx_config_value,
+    managed_agent_provider, mask_runx_config_file, resolve_runx_global_home_dir,
+    resolve_runx_workspace_base, update_runx_config_value, write_runx_config_file,
 };
 use tempfile::tempdir;
 
@@ -135,6 +135,7 @@ fn config_loads_and_writes_supported_keys_only() -> Result<(), Box<dyn std::erro
             provider: Some("openai".to_owned()),
             model: Some("gpt-test".to_owned()),
             api_key_ref: None,
+            ..RunxAgentConfig::default()
         }),
         public: None,
         credentials: None,
@@ -217,7 +218,9 @@ fn config_loads_managed_agent_env_precedence_and_local_key_fallback()
         Some(ManagedAgentConfig {
             provider: managed_agent_provider::OPENAI.into(),
             model: "gpt-test".to_owned(),
-            api_key: SecretString::new("sk-explicit"),
+            api_key: Some(SecretString::new("sk-explicit")),
+            endpoint_url: None,
+            auth_mode: runx_runtime::ManagedAgentAuthMode::ApiKey,
         })
     );
 
@@ -227,6 +230,7 @@ fn config_loads_managed_agent_env_precedence_and_local_key_fallback()
                 provider: Some("anthropic".to_owned()),
                 model: Some("claude-test".to_owned()),
                 api_key_ref: None,
+                ..RunxAgentConfig::default()
             }),
             public: None,
             credentials: None,
@@ -242,7 +246,9 @@ fn config_loads_managed_agent_env_precedence_and_local_key_fallback()
         Some(ManagedAgentConfig {
             provider: managed_agent_provider::ANTHROPIC.into(),
             model: "claude-test".to_owned(),
-            api_key: SecretString::new("local-secret"),
+            api_key: Some(SecretString::new("local-secret")),
+            endpoint_url: None,
+            auth_mode: runx_runtime::ManagedAgentAuthMode::ApiKey,
         })
     );
 
@@ -269,6 +275,7 @@ fn config_matches_blank_env_overlay_edges() -> Result<(), Box<dyn std::error::Er
                 provider: Some("anthropic".to_owned()),
                 model: Some("claude-file".to_owned()),
                 api_key_ref: None,
+                ..RunxAgentConfig::default()
             }),
             public: None,
             credentials: None,
@@ -307,9 +314,134 @@ fn config_matches_blank_env_overlay_edges() -> Result<(), Box<dyn std::error::Er
         ("ANTHROPIC_API_KEY", "provider-secret"),
     ]);
     assert_eq!(
-        load_managed_agent_config(&blank_generic_key, temp.path())?.map(|config| config.api_key),
+        load_managed_agent_config(&blank_generic_key, temp.path())?
+            .and_then(|config| config.api_key),
         Some(SecretString::new("local-secret"))
     );
+    Ok(())
+}
+
+#[test]
+fn explicit_keyless_mode_requires_exact_loopback_and_remains_repairable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let config_path = temp.path().join("config.json");
+    let endpoint = "http://127.0.0.1:18081/v1/chat/completions";
+    let config = RunxConfigFile {
+        agent: Some(RunxAgentConfig {
+            provider: Some("openai".to_owned()),
+            model: Some("qwen2.5".to_owned()),
+            endpoint_url: Some(endpoint.to_owned()),
+            auth_mode: Some("local_none".to_owned()),
+            ..RunxAgentConfig::default()
+        }),
+        ..RunxConfigFile::default()
+    };
+    write_runx_config_file(&config_path, &config)?;
+    let env = env_map([("RUNX_HOME", temp.path().to_str().unwrap_or_default())]);
+    assert_eq!(
+        load_managed_agent_config(&env, temp.path())?,
+        Some(ManagedAgentConfig {
+            provider: managed_agent_provider::OPENAI.into(),
+            model: "qwen2.5".to_owned(),
+            api_key: None,
+            endpoint_url: Some(endpoint.to_owned()),
+            auth_mode: ManagedAgentAuthMode::LocalNone,
+        })
+    );
+
+    let with_stored_key = update_runx_config_value(
+        config.clone(),
+        ConfigKey::AgentApiKey,
+        "stored-api-key",
+        temp.path(),
+    )?;
+    write_runx_config_file(&config_path, &with_stored_key)?;
+    let local_override = env_map([
+        ("RUNX_HOME", temp.path().to_str().unwrap_or_default()),
+        ("RUNX_AGENT_AUTH_MODE", "local_none"),
+    ]);
+    assert_eq!(
+        load_managed_agent_config(&local_override, temp.path())?
+            .ok_or("missing local model")?
+            .api_key,
+        None
+    );
+    write_runx_config_file(&config_path, &config)?;
+
+    for (field, expected_key) in [("provider", "agent.provider"), ("model", "agent.model")] {
+        let mut incomplete = config.clone();
+        let agent = incomplete.agent.as_mut().ok_or("missing agent")?;
+        if field == "provider" {
+            agent.provider = None;
+        } else {
+            agent.model = None;
+        }
+        write_runx_config_file(&config_path, &incomplete)?;
+        assert!(matches!(
+            load_managed_agent_config(&env, temp.path()),
+            Err(ConfigError::InvalidAgentSetting { key, .. }) if key == expected_key
+        ));
+    }
+    write_runx_config_file(&config_path, &config)?;
+
+    let mut invalid = config.clone();
+    invalid.agent.as_mut().ok_or("missing agent")?.auth_mode = Some("typo".to_owned());
+    write_runx_config_file(&config_path, &invalid)?;
+    assert_eq!(
+        lookup_runx_config_value(
+            &load_runx_config_file(&config_path)?,
+            ConfigKey::AgentAuthMode
+        ),
+        Some("typo".to_owned())
+    );
+    assert!(matches!(
+        load_managed_agent_config(&env, temp.path()),
+        Err(ConfigError::InvalidAgentSetting {
+            key: "agent.auth_mode",
+            ..
+        })
+    ));
+    assert!(matches!(
+        update_runx_config_value(
+            invalid.clone(),
+            ConfigKey::AgentAuthMode,
+            "typo",
+            temp.path()
+        ),
+        Err(ConfigError::InvalidAgentSetting {
+            key: "agent.auth_mode",
+            ..
+        })
+    ));
+    let repaired =
+        update_runx_config_value(invalid, ConfigKey::AgentAuthMode, "local_none", temp.path())?;
+    write_runx_config_file(&config_path, &repaired)?;
+    assert!(load_managed_agent_config(&env, temp.path())?.is_some());
+
+    for forbidden in [
+        "http://localhost:18081/v1/chat/completions",
+        "http://127.0.0.2:18081/v1/chat/completions",
+        "http://127.0.0.1:18081/other",
+        "http://127.0.0.1:18081/v1/chat/completions?next=evil",
+        "https://127.0.0.1:18081/v1/chat/completions",
+        "http://127.0.0.1:18081@evil.example/v1/chat/completions",
+    ] {
+        let env = env_map([
+            ("RUNX_HOME", temp.path().to_str().unwrap_or_default()),
+            ("RUNX_AGENT_ENDPOINT_URL", forbidden),
+        ]);
+        assert!(
+            matches!(
+                load_managed_agent_config(&env, temp.path()),
+                Err(ConfigError::InvalidAgentSetting {
+                    key: "agent.endpoint_url",
+                    ..
+                })
+            ),
+            "endpoint must be rejected: {forbidden}"
+        );
+    }
     Ok(())
 }
 

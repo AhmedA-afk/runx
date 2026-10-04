@@ -74,9 +74,35 @@ pub(super) fn read_graph_state(
     package_digest: &str,
     execution_closure_digest: &str,
 ) -> Result<GraphSkillRunState, SkillRunError> {
+    try_read_graph_state(
+        request,
+        workspace,
+        receipts,
+        run_id,
+        runner_name,
+        package_digest,
+        execution_closure_digest,
+    )?
+    .ok_or_else(|| invalid(format!("graph state for run {run_id} is missing")))
+}
+
+pub(super) fn try_read_graph_state(
+    request: &SkillRunRequest,
+    workspace: &WorkspaceEnv,
+    receipts: &ReceiptServices,
+    run_id: &str,
+    runner_name: &str,
+    package_digest: &str,
+    execution_closure_digest: &str,
+) -> Result<Option<GraphSkillRunState>, SkillRunError> {
     let path = graph_state_path(request, workspace, receipts, run_id);
-    let raw = fs::read_to_string(&path)
-        .map_err(|source| RuntimeError::io(format!("reading {}", path.display()), source))?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(RuntimeError::io(format!("reading {}", path.display()), source).into());
+        }
+    };
     let state: GraphSkillRunState = serde_json::from_str(&raw).map_err(|source| {
         invalid(format!(
             "graph state file {} is malformed; the run cannot resume safely without a valid checkpoint: {source}",
@@ -113,7 +139,7 @@ pub(super) fn read_graph_state(
             state.execution_closure_digest
         )));
     }
-    Ok(state)
+    Ok(Some(state))
 }
 
 fn state_temp_path(path: &Path) -> PathBuf {

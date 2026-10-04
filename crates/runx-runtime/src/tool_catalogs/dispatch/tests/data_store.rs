@@ -13,6 +13,45 @@ use crate::adapter::{InvocationOutput, InvocationStatus};
 const SOURCE: &str = "local://runx-data-store/native-contract";
 const RESOURCE: &str = "board_events";
 
+#[cfg(unix)]
+#[test]
+fn default_local_sqlite_source_keeps_private_data_in_private_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempdir()?;
+    let env = super::tool_root_env(workspace.path());
+    let source_digest = sha256_prefixed(SOURCE.as_bytes());
+    let database = workspace.path().join(format!(
+        ".runx/data/local-sources/source-{}.sqlite",
+        &source_digest["sha256:".len().."sha256:".len() + 16]
+    ));
+    let directory = database.parent().ok_or("SQLite source has no directory")?;
+
+    let result = invoke(
+        "data.append_event",
+        append_inputs("private-1", 0, "private-1:create", "private.created", 1),
+        workspace.path(),
+        env.clone(),
+    )?;
+    assert_packet(&result, "committed", "append_event", 0, 1)?;
+    assert_eq!(fs::metadata(directory)?.permissions().mode() & 0o777, 0o700);
+    assert_eq!(fs::metadata(&database)?.permissions().mode() & 0o777, 0o600);
+
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o644))?;
+    let read = invoke(
+        "data.read_events",
+        read_inputs("private-1", 1, None),
+        workspace.path(),
+        env,
+    )?;
+    assert_packet(&read, "read", "read_events", 1, 1)?;
+    assert_eq!(fs::metadata(directory)?.permissions().mode() & 0o777, 0o700);
+    assert_eq!(fs::metadata(&database)?.permissions().mode() & 0o777, 0o600);
+    Ok(())
+}
+
 #[test]
 fn native_event_store_enforces_append_replay_conflict_and_bounded_reads()
 -> Result<(), Box<dyn std::error::Error>> {

@@ -189,6 +189,13 @@ pub struct ReqwestHttpTransport {
     pub(super) request_timeout: std::time::Duration,
 }
 
+/// Only the selected local model endpoint is reachable through this transport.
+#[derive(Clone, Debug)]
+pub struct ExactLoopbackHttpTransport {
+    pub(super) inner: ReqwestHttpTransport,
+    pub(super) endpoint: String,
+}
+
 pub(crate) fn sensitive_header_name(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
     normalized == "authorization"

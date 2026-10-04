@@ -8,6 +8,9 @@ use super::recovery::{
     discard_provider_attempt, persist_provider_attempt, persist_provider_readback,
     persist_provider_unknown,
 };
+use super::standing::{
+    NotificationAuthorityError, mark_notification_dispatch, reset_notification_after_rejection,
+};
 use super::{
     PROVIDER_PERMISSION_EFFECT_FAMILY, ProviderNativeAccess, ProviderPermissionAdmission,
     ProviderPermissionEffect,
@@ -42,6 +45,44 @@ pub(super) fn invoke_provider_tool(
             reason: "local GitHub mutation has an unknown prior outcome and cannot be repeated safely; inspect the provider result before resuming"
                 .to_owned(),
         });
+    }
+    if access == ProviderNativeAccess::Mutate
+        && let Some(proof) = input.admission.notification_proof.as_ref()
+        && input
+            .admission
+            .recovery
+            .as_ref()
+            .and_then(super::recovery::ProviderRecoveryContext::cached_readback)
+            .is_none()
+    {
+        let store_root = input
+            .admission
+            .recovery
+            .as_ref()
+            .map(super::recovery::ProviderRecoveryContext::store_root)
+            .ok_or_else(|| {
+                provider_tool_error(request.tool_ref, "notification recovery context is missing")
+            })?;
+        match mark_notification_dispatch(store_root, proof, attempt.resolved().plan_digest()) {
+            Ok(()) => {}
+            Err(NotificationAuthorityError::Unknown(reason)) => {
+                return Err(RuntimeError::ProviderEffectUnknown {
+                    plan_digest: attempt.resolved().plan_digest().to_owned(),
+                    idempotency_key: attempt.idempotency_key().to_owned(),
+                    reason: reason.to_owned(),
+                });
+            }
+            Err(NotificationAuthorityError::Denied(reason))
+            | Err(NotificationAuthorityError::Invalid(reason)) => {
+                return Err(provider_tool_error(request.tool_ref, reason));
+            }
+            Err(NotificationAuthorityError::Store(error)) => {
+                return Err(RuntimeError::effect_state(
+                    "reserving notification dispatch",
+                    error,
+                ));
+            }
+        }
     }
     if access == ProviderNativeAccess::Mutate {
         persist_provider_attempt(&input.admission, &attempt)
@@ -101,6 +142,23 @@ pub(super) fn invoke_provider_tool(
             return error;
         }
         if matches!(error, RuntimeError::ProviderEffectRejected { .. }) {
+            if let RuntimeError::ProviderEffectRejected {
+                ref provider_code, ..
+            } = error
+                && standing_rejection_is_pre_execution(provider_code)
+                && let Some(proof) = input.admission.notification_proof.as_ref()
+                && let Some(recovery) = input.admission.recovery.as_ref()
+                && let Err(state_error) = reset_notification_after_rejection(
+                    recovery.store_root(),
+                    proof,
+                    attempt.resolved().plan_digest(),
+                )
+            {
+                return RuntimeError::effect_state(
+                    "resetting a proven rejected notification",
+                    format!("{state_error}; original provider error: {error}"),
+                );
+            }
             return match discard_provider_attempt(&input.admission) {
                 Ok(()) => error,
                 Err(state_error) => RuntimeError::effect_state(
@@ -124,6 +182,17 @@ pub(super) fn invoke_provider_tool(
             reason: error.to_string(),
         }
     })
+}
+
+fn standing_rejection_is_pre_execution(code: &str) -> bool {
+    matches!(
+        code,
+        "scope_mismatch"
+            | "access_mismatch"
+            | "target_mismatch"
+            | "operation_unsupported"
+            | "binding_unavailable"
+    )
 }
 
 /// An explicitly marked provider read carrying the exact mutation identity is
@@ -220,10 +289,9 @@ fn invoke_hosted_provider(
     })
 }
 
-/// The Connect API encodes a provider's disposition in its status: 400, 404,
-/// 409 and 502 mean the provider answered and applied nothing. Everything else
-/// (503, transport failures, malformed evidence) leaves a write's outcome
-/// unknown and keeps the conservative path.
+/// A conflict is a definite refusal only when Connect says the key belongs to
+/// another request. An in-flight claim may already have reached the provider;
+/// retain native recovery state instead of discarding it on HTTP 409.
 fn hosted_rejection(error: &ProviderOperationError) -> Option<(u16, String, String)> {
     match error {
         ProviderOperationError::HostedApi(HostedApiOperationError::Api {
@@ -231,7 +299,10 @@ fn hosted_rejection(error: &ProviderOperationError) -> Option<(u16, String, Stri
             code,
             detail,
             ..
-        }) if matches!(*status, 400 | 404 | 409 | 502) => {
+        }) if matches!(*status, 400 | 404 | 502)
+            || (*status == 403 && code == "binding_unavailable")
+            || (*status == 409 && code == "idempotency_conflict") =>
+        {
             Some((*status, code.clone(), detail.clone()))
         }
         _ => None,
@@ -391,7 +462,7 @@ mod tests {
 
     #[test]
     fn definite_refusals_are_rejections_and_unknown_outcomes_are_not() {
-        for status in [400, 404, 409, 502] {
+        for status in [400, 404, 502] {
             let rejection = hosted_rejection(&api_error(status));
             assert!(
                 rejection.is_some(),
@@ -402,9 +473,31 @@ mod tests {
             assert_eq!(code, "invalid_input");
             assert!(reason.contains("languageCode"));
         }
-        for status in [429, 500, 503] {
+        for status in [409, 429, 500, 503] {
             assert!(hosted_rejection(&api_error(status)).is_none());
         }
+        let conflict = ProviderOperationError::HostedApi(HostedApiOperationError::Api {
+            operation: "provider operation",
+            status: 409,
+            code: "idempotency_conflict".to_owned(),
+            detail: "the key belongs to another request".to_owned(),
+            hint: None,
+            retry_after_seconds: None,
+        });
+        assert!(hosted_rejection(&conflict).is_some());
         assert!(hosted_rejection(&ProviderOperationError::InvalidOperation).is_none());
+    }
+
+    #[test]
+    fn hosted_in_flight_idempotency_is_an_unknown_outcome() {
+        let error = ProviderOperationError::HostedApi(HostedApiOperationError::Api {
+            operation: "provider operation",
+            status: 409,
+            code: "idempotency_in_flight".to_owned(),
+            detail: "the mutation may already be running".to_owned(),
+            hint: None,
+            retry_after_seconds: None,
+        });
+        assert!(hosted_rejection(&error).is_none());
     }
 }

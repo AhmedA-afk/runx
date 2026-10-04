@@ -6,7 +6,7 @@ regenerated from a parallel JavaScript model of Runx execution; current
 structural truth comes from native package validation, operator-context
 expansion, the official lock, and package harnesses.
 
-**Status: implemented.** This covers all 82 top-level skill packages: 78 public
+**Status: implemented.** This covers all 83 top-level skill packages: 79 public
 and 4 internal.
 No additional package is removed or hidden by this review. Improvement recommendations preserve the capability until a separate product decision approves a migration.
 
@@ -203,6 +203,7 @@ or an opaque hosted-admission payload inside a typed payment envelope.
 | nws-weather-forecast | operation | public/branded | tool:http.read | complete archetype bar | keep | The NWS skill performs bounded keyless provider reads with live HTTP proof. | none |
 | open-meteo-weather-forecast | operation | public/branded | tool:http.read | complete archetype bar | keep | The Open-Meteo skill performs global keyless forecast and air-quality reads with live HTTP proof. | none |
 | operator-inbox | operation | public/canonical | tool:data.list_stream_heads | complete archetype bar | keep | Direct use now opens a bounded local `.runx` action queue; explicit write and read runners preserve dispositions and normalized provider observations without moving queue ownership into Cloud. | none |
+| personal-assistant | context | public/context | javascript; 1 agent act -> declared artifact | harness passed; live read-only attention turn; no delivery claim | keep | The bounded attention rubric turns admitted source evidence and current dispositions into a source-bound brief, exact read-only proposals, and a clamped next-check recommendation. The local operator retains source reads, queue state, timer and delivery authority. | Prove the composed approval and follow-up journey before claiming an unattended operating assistant. |
 | ops-desk | workflow | public/canonical | tool:data.read_projection; 1 agent act -> declared artifact | complete archetype bar | keep | The default starts from bounded durable state and returns the chosen governed lane or exact blocker; supplied-state, agency dispatch, and action-review runners remain explicit. | none |
 | organic-growth | artifact | public/canonical | javascript, tool:evidence.verify_artifact; 1 agent act -> declared artifact | complete archetype bar | keep | The provider-neutral planning skill turns bounded search, analytics, site, and market evidence into a prioritized decision packet, then deterministically binds every material claim and action to admitted source digests; three focused journeys prove cross-source usefulness, invented-evidence refusal, and a no-evidence stop without claiming execution or ranking effects. | none |
 | adopt-skill | builder | public/canonical | javascript, tool:data.digest, tool:fs.read, tool:git.blob_digest, tool:runx.skill.validate; 1 agent act -> declared artifact | complete archetype bar | keep | The public adoption lane targets Runx's native upstream binding architecture: it recomputes local source and Git-blob pins, requires explicit provenance, keeps profile design as bounded agent judgment, emits exact binding.json and X.yaml artifacts, and releases them only after native inspection, isolated harness proof, and catalog-check dogfood. | none |

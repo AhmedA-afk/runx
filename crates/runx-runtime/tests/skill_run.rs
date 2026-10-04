@@ -2661,8 +2661,9 @@ fn native_graph_skill_run_rejects_nested_registry_skill_without_registry_dir()
 #[test]
 fn native_graph_skill_run_does_not_rerun_final_step() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
-    let skill_dir = write_graph_nested_cli_counter_skill(temp.path())?;
+    let skill_dir = write_graph_nested_cli_counter_skill(temp.path(), false)?;
     let receipt_dir = temp.path().join("receipts");
+    let state_path = receipt_dir.join("runs/run_pinned_counter.graph-state.json");
     let count_file = temp.path().join("count.txt");
     let inputs = [(
         "count_file".to_owned(),
@@ -2671,22 +2672,109 @@ fn native_graph_skill_run_does_not_rerun_final_step() -> Result<(), Box<dyn std:
     .into_iter()
     .collect::<BTreeMap<_, _>>();
 
-    let result = run_skill(SkillRunRequest {
+    let request = SkillRunRequest {
         skill_path: skill_dir,
-        receipt_dir: Some(receipt_dir),
-        run_id: None,
+        receipt_dir: Some(receipt_dir.clone()),
+        run_id: Some("run_pinned_counter".to_owned()),
         answers_path: None,
         inputs,
         env: path_env(),
         cwd: temp.path().to_path_buf(),
         managed_agent: Default::default(),
         local_credential: None,
-    })?;
+    };
+    let result = run_skill(request.clone())?;
 
     let output = object(&result.output, "counter graph skill result")?;
     assert_eq!(string_field(output, "status"), Some("sealed"));
+    assert_eq!(fs::read_to_string(&count_file)?, "1");
+
+    let recovered = run_skill(request.clone())?;
+    assert_eq!(recovered.output, result.output);
+    assert_eq!(recovered.receipt_refs, result.receipt_refs);
+    assert_eq!(fs::read_to_string(&count_file)?, "1");
+
+    let mut drift = request.clone();
+    drift.inputs.insert(
+        "count_file".to_owned(),
+        JsonValue::String(
+            temp.path()
+                .join("different.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    let error = run_skill(drift)
+        .err()
+        .ok_or("pinned graph identity must reject input drift")?;
+    assert!(
+        error
+            .to_string()
+            .contains("cannot replace its original inputs")
+    );
+    assert_eq!(fs::read_to_string(&count_file)?, "1");
+
+    let original_state = fs::read(&state_path)?;
+    let mut incomplete: serde_json::Value = serde_json::from_slice(&original_state)?;
+    incomplete
+        .as_object_mut()
+        .ok_or("graph state is not an object")?
+        .remove("completed_receipt_id");
+    fs::write(&state_path, serde_json::to_vec(&incomplete)?)?;
+    let error = run_skill(request.clone())
+        .err()
+        .ok_or("missing sealed identity must hold")?;
+    assert!(
+        error
+            .to_string()
+            .contains("lacks its primary receipt identity")
+    );
+    assert_eq!(fs::read_to_string(&count_file)?, "1");
+    fs::write(&state_path, original_state)?;
+
+    let receipt_id = result.receipt_refs.first().ok_or("missing graph receipt")?;
+    let receipt_path = LocalReceiptStore::new(&receipt_dir).receipt_path(receipt_id)?;
+    fs::write(receipt_path, b"{}")?;
+    let error = run_skill(request)
+        .err()
+        .ok_or("tampered sealed receipt must hold")?;
+    assert!(
+        error
+            .to_string()
+            .contains("completed graph receipt is invalid")
+    );
     assert_eq!(fs::read_to_string(count_file)?, "1");
 
+    Ok(())
+}
+
+#[cfg(feature = "cli-tool")]
+#[test]
+fn native_graph_skill_run_recovers_domain_act_receipt() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let skill_dir = write_graph_nested_cli_counter_skill(temp.path(), true)?;
+    let count_file = temp.path().join("count.txt");
+    let request = SkillRunRequest {
+        skill_path: skill_dir,
+        receipt_dir: Some(temp.path().join("receipts")),
+        run_id: Some("run_pinned_domain_act".to_owned()),
+        answers_path: None,
+        inputs: [(
+            "count_file".to_owned(),
+            JsonValue::String(count_file.to_string_lossy().into_owned()),
+        )]
+        .into_iter()
+        .collect(),
+        env: path_env(),
+        cwd: temp.path().to_path_buf(),
+        managed_agent: Default::default(),
+        local_credential: None,
+    };
+    let result = run_skill(request.clone())?;
+    let recovered = run_skill(request)?;
+    assert_eq!(recovered.output, result.output);
+    assert_eq!(recovered.receipt_refs, result.receipt_refs);
+    assert_eq!(fs::read_to_string(count_file)?, "1");
     Ok(())
 }
 
@@ -3724,6 +3812,7 @@ runners:
 #[cfg(feature = "cli-tool")]
 fn write_graph_nested_cli_counter_skill(
     root: &Path,
+    domain_act: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let child_dir = root.join("child-counter");
     crate::support::write_test_skill_package(
@@ -3772,9 +3861,15 @@ console.log(JSON.stringify({ counted: { count } }));
         skill_dir.join("SKILL.md"),
         "---\nname: graph-nested-cli-counter\n---\n# Graph Nested CLI Counter\n",
     )?;
+    let act = if domain_act {
+        "    act:\n      purpose: Record one completed counter action.\n"
+    } else {
+        ""
+    };
     fs::write(
         skill_dir.join("X.yaml"),
-        r#"
+        format!(
+            r#"
 skill: graph-nested-cli-counter
 runners:
   graph:
@@ -3784,6 +3879,7 @@ runners:
       count_file:
         type: string
         required: true
+{act}
     graph:
       name: graph-nested-cli-counter
       result_from:
@@ -3793,7 +3889,8 @@ runners:
           skill: ../child-counter
           inputs:
             count_file: $input.count_file
-"#,
+"#
+        ),
     )?;
     Ok(skill_dir)
 }

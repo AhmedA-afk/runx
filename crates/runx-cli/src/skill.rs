@@ -16,7 +16,7 @@ mod environment_readiness;
 mod inputs;
 mod marketplace;
 mod operator_context;
-mod output;
+pub(crate) mod output;
 mod parser;
 mod provider_readiness;
 mod resolver;

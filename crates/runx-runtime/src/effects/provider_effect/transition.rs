@@ -7,6 +7,27 @@ use super::{
 };
 
 impl ProviderEffectResolved {
+    /// The provider-facing key is stable for the plan. Slack requires UUID
+    /// syntax; other providers retain the established Runx key format.
+    pub fn provider_idempotency_key(&self) -> String {
+        if self.intent.provider() == "slack"
+            && self.intent.operation() == "channel.post"
+            && let Some(hex) = self.plan_digest.strip_prefix("sha256:")
+            && hex.len() == 64
+            && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return format!(
+                "{}-{}-4{}-8{}-{}",
+                &hex[..8],
+                &hex[8..12],
+                &hex[13..16],
+                &hex[17..20],
+                &hex[20..32]
+            );
+        }
+        format!("runx:{}", self.plan_digest)
+    }
+
     pub fn begin(
         self,
         approval: Option<ProviderApprovalEvidence>,
@@ -34,7 +55,10 @@ impl ProviderEffectResolved {
                 if evidence.plan_digest != self.plan_digest {
                     return Err(ProviderEffectError::ApprovalDrift);
                 }
-                if evidence.actor != "human" && evidence.actor != "paid_external_job" {
+                if evidence.actor != "human"
+                    && evidence.actor != "paid_external_job"
+                    && evidence.actor != "standing_notification"
+                {
                     return Err(ProviderEffectError::ApprovalActorInvalid);
                 }
                 Some(ProviderEffectApproval {
@@ -44,7 +68,7 @@ impl ProviderEffectResolved {
                 })
             }
         };
-        let idempotency_key = format!("runx:{}", self.plan_digest);
+        let idempotency_key = self.provider_idempotency_key();
         Ok(ProviderEffectAttempt {
             resolved: self,
             approval,

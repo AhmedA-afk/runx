@@ -9,23 +9,23 @@ use std::collections::BTreeMap;
 use std::error::Error as StdError;
 #[cfg(feature = "async-http")]
 use std::fmt;
+#[cfg(any(feature = "async-http", test))]
+use std::net::IpAddr;
 #[cfg(feature = "async-http")]
 use std::net::SocketAddr;
-#[cfg(any(feature = "async-http", test))]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(feature = "async-http")]
 use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "async-http")]
 use std::time::Duration;
 
-#[cfg(any(feature = "async-http", test))]
 use url::Url;
 
 #[cfg(feature = "async-http")]
 pub(crate) use self::types::sensitive_header_name;
 pub use self::types::{
-    HttpMethod, ReqwestHttpTransport, RuntimeHttpHeader, RuntimeHttpRequest, RuntimeHttpResponse,
-    RuntimeHttpTransport,
+    ExactLoopbackHttpTransport, HttpMethod, ReqwestHttpTransport, RuntimeHttpHeader,
+    RuntimeHttpRequest, RuntimeHttpResponse, RuntimeHttpTransport,
 };
 pub(crate) use self::types::{RuntimeHarnessHttpExchange, RuntimeHarnessHttpRequestBody};
 
@@ -54,7 +54,7 @@ const MAX_SAFE_READ_RETRY_DELAY: Duration = Duration::from_secs(2);
 #[cfg(feature = "async-http")]
 static HTTP_CLIENT_RUNTIME: RetryableCell<tokio::runtime::Runtime> = RetryableCell::new();
 #[cfg(feature = "async-http")]
-const HTTP_CLIENT_PROFILE_COUNT: usize = 5;
+const HTTP_CLIENT_PROFILE_COUNT: usize = 6;
 #[cfg(feature = "async-http")]
 static HTTP_CLIENTS: [RetryableCell<reqwest::Client>; HTTP_CLIENT_PROFILE_COUNT] =
     [const { RetryableCell::new() }; HTTP_CLIENT_PROFILE_COUNT];
@@ -99,6 +99,7 @@ enum TransportProfile {
     PublicPatient = 2,
     PublicProviderOperation = 3,
     PrivateProviderOperation = 4,
+    ExactLoopbackAgent = 5,
 }
 
 #[cfg(feature = "async-http")]
@@ -107,6 +108,7 @@ struct TransportConfig {
     request_timeout: Duration,
     connect_timeout: Duration,
     allow_private_networks: bool,
+    no_proxy: bool,
 }
 
 #[cfg(feature = "async-http")]
@@ -117,26 +119,37 @@ impl TransportProfile {
                 request_timeout: DEFAULT_HTTP_REQUEST_TIMEOUT,
                 connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
                 allow_private_networks: false,
+                no_proxy: false,
             },
             Self::PrivateStandard => TransportConfig {
                 request_timeout: DEFAULT_HTTP_REQUEST_TIMEOUT,
                 connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
                 allow_private_networks: true,
+                no_proxy: false,
             },
             Self::PublicPatient => TransportConfig {
                 request_timeout: MANAGED_AGENT_REQUEST_TIMEOUT,
                 connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
                 allow_private_networks: false,
+                no_proxy: false,
             },
             Self::PublicProviderOperation => TransportConfig {
                 request_timeout: PROVIDER_OPERATION_REQUEST_TIMEOUT,
                 connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
                 allow_private_networks: false,
+                no_proxy: false,
             },
             Self::PrivateProviderOperation => TransportConfig {
                 request_timeout: PROVIDER_OPERATION_REQUEST_TIMEOUT,
                 connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
                 allow_private_networks: true,
+                no_proxy: false,
+            },
+            Self::ExactLoopbackAgent => TransportConfig {
+                request_timeout: MANAGED_AGENT_REQUEST_TIMEOUT,
+                connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
+                allow_private_networks: true,
+                no_proxy: true,
             },
         }
     }
@@ -176,6 +189,7 @@ impl ReqwestHttpTransport {
             request_timeout,
             connect_timeout,
             allow_private_networks,
+            no_proxy: false,
         })
         .map_err(|message| RuntimeHttpError::Transport { message })?;
         Ok(Self {
@@ -199,6 +213,18 @@ impl ReqwestHttpTransport {
     /// guard and short connect timeout.
     pub fn for_managed_agent() -> Result<Self, RuntimeHttpError> {
         Self::from_profile(TransportProfile::PublicPatient)
+    }
+
+    /// Construct a local model transport whose request URL is checked again at
+    /// every send. It never inherits an HTTP proxy or follows redirects.
+    pub fn for_exact_loopback_agent(
+        endpoint: &str,
+    ) -> Result<ExactLoopbackHttpTransport, RuntimeHttpError> {
+        validate_exact_loopback_agent_endpoint(endpoint)?;
+        Ok(ExactLoopbackHttpTransport {
+            inner: Self::from_profile(TransportProfile::ExactLoopbackAgent)?,
+            endpoint: endpoint.to_owned(),
+        })
     }
 
     /// Build the transport used only for authenticated provider operations.
@@ -459,6 +485,11 @@ fn build_http_client(config: TransportConfig) -> Result<reqwest::Client, String>
                 .iter()
                 .filter_map(|der| reqwest::Certificate::from_der(der).ok()),
         );
+    let builder = if config.no_proxy {
+        builder.no_proxy()
+    } else {
+        builder
+    };
     let builder = if config.allow_private_networks {
         builder
     } else {
@@ -496,6 +527,21 @@ impl RuntimeHttpTransport for ReqwestHttpTransport {
         response_limit: usize,
     ) -> Result<RuntimeHttpResponse, RuntimeHttpError> {
         self.send_with_limit(request, response_limit, false, true)
+    }
+}
+
+#[cfg(feature = "async-http")]
+impl RuntimeHttpTransport for ExactLoopbackHttpTransport {
+    fn send(&self, request: RuntimeHttpRequest) -> Result<RuntimeHttpResponse, RuntimeHttpError> {
+        if request.method != HttpMethod::Post
+            || request.url != self.endpoint
+            || validate_exact_loopback_agent_endpoint(&request.url).is_err()
+        {
+            return Err(RuntimeHttpError::Transport {
+                message: "local model request exceeded its exact endpoint binding".to_owned(),
+            });
+        }
+        self.inner.send(request)
     }
 }
 
@@ -830,6 +876,29 @@ fn validate_http_url(value: &str, allow_private_networks: bool) -> Result<(), Ru
             scheme: scheme.to_owned(),
         }),
     }
+}
+
+/// Validate the complete, canonical local chat-completions endpoint. A hostname,
+/// alternate loopback address, path, credential, query or fragment is excluded.
+pub(crate) fn validate_exact_loopback_agent_endpoint(value: &str) -> Result<(), RuntimeHttpError> {
+    let url = Url::parse(value)?;
+    let loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip == Ipv4Addr::LOCALHOST)
+        || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip == Ipv6Addr::LOCALHOST);
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || url.path() != "/v1/chat/completions"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.as_str() != value
+    {
+        return Err(RuntimeHttpError::Transport {
+            message: "invalid exact loopback model endpoint".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "async-http", test))]
@@ -1252,6 +1321,55 @@ mod tests {
             super::validate_http_url("file:///tmp/runx.sock", false),
             Err(RuntimeHttpError::UnsupportedUrlScheme { .. })
         ));
+    }
+
+    #[test]
+    fn local_model_endpoint_requires_a_literal_exact_loopback_url() {
+        for allowed in [
+            "http://127.0.0.1:18081/v1/chat/completions",
+            "http://[::1]:18081/v1/chat/completions",
+        ] {
+            assert!(super::validate_exact_loopback_agent_endpoint(allowed).is_ok());
+        }
+        for denied in [
+            "http://localhost:18081/v1/chat/completions",
+            "http://127.0.0.2:18081/v1/chat/completions",
+            "http://127.0.0.1/v1/chat/completions",
+            "http://127.0.0.1:18081/v1/chat/completions?x=1",
+            "http://127.0.0.1:18081/v1/models",
+            "http://user@127.0.0.1:18081/v1/chat/completions",
+        ] {
+            assert!(
+                super::validate_exact_loopback_agent_endpoint(denied).is_err(),
+                "{denied}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "async-http")]
+    fn local_model_transport_rechecks_every_request() -> Result<(), RuntimeHttpTestError> {
+        let endpoint = "http://127.0.0.1:18081/v1/chat/completions";
+        let transport = ReqwestHttpTransport::for_exact_loopback_agent(endpoint)?;
+        for (method, url) in [
+            (HttpMethod::Get, endpoint),
+            (HttpMethod::Post, "http://127.0.0.1:18081/v1/models"),
+            (
+                HttpMethod::Post,
+                "http://127.0.0.2:18081/v1/chat/completions",
+            ),
+        ] {
+            assert!(matches!(
+                transport.send(RuntimeHttpRequest {
+                    method,
+                    url: url.to_owned(),
+                    headers: Vec::new(),
+                    body: None,
+                }),
+                Err(RuntimeHttpError::Transport { .. })
+            ));
+        }
+        Ok(())
     }
 
     #[test]

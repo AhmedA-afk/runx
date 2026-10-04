@@ -99,6 +99,36 @@ fn provider_effect_duplicate_retry_reuses_idempotency() {
 }
 
 #[test]
+fn slack_channel_post_uses_stable_uuid_provider_identity() {
+    let intent = ProviderEffectIntent::new(ProviderEffectIntentInput {
+        class: ProviderEffectClass::Mutation,
+        provider: "slack",
+        operation: "channel.post",
+        target: "slack://T123/C456",
+        payload: &JsonObject::new(),
+        required_scopes: vec!["channel.post".to_owned()],
+        amount: None,
+        approval_digest: None,
+        request_key: Some("exact-post"),
+    })
+    .expect("intent");
+    let resolved = ProviderEffectResolved::new(
+        intent,
+        ProviderEffectAuthority::new("grant-1", "runx:principal:operator").expect("authority"),
+    )
+    .expect("resolved");
+    let key = resolved.provider_idempotency_key();
+    assert_eq!(key.len(), 36);
+    assert_eq!(key.as_bytes()[14], b'4');
+    assert_eq!(key.as_bytes()[19], b'8');
+    assert_eq!(
+        resolved.begin(None).expect("attempt").idempotency_key(),
+        key
+    );
+    assert!(mutation_idempotency().starts_with("runx:sha256:"));
+}
+
+#[test]
 fn provider_effect_ack_without_readback_cannot_finalize() {
     let acknowledged = mutation_attempt()
         .acknowledge(ack(
