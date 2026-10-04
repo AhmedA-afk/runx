@@ -34,7 +34,6 @@ use crate::execution::runner::{
 };
 use crate::host::Host;
 use crate::journal::{PausedRunCheckpoint, append_paused_run_checkpoint};
-use crate::receipts::store::LocalReceiptStore;
 use crate::receipts::{DomainActReceiptRequest, RuntimeReceiptSignatureConfig, domain_act_receipt};
 use crate::services::{ReceiptServices, WorkspaceEnv};
 
@@ -489,16 +488,17 @@ fn restore_completed_graph_skill_run(
         context.request.receipt_dir.as_deref(),
         None,
     );
-    let store = LocalReceiptStore::new(receipt_path.path);
     let policy = context.receipts.signature_config().signature_policy();
-    let graph_receipt = store
-        .read_exact_with_policy(graph_receipt_id, policy)
+    let graph_receipt = context
+        .receipts
+        .read_local_receipt(graph_receipt_id, &receipt_path.path)
         .map_err(|error| invalid(format!("completed graph receipt is invalid: {error}")))?;
     let primary_receipt = if receipt_id == graph_receipt_id {
         graph_receipt.clone()
     } else {
-        store
-            .read_exact_with_policy(receipt_id, policy)
+        context
+            .receipts
+            .read_local_receipt(receipt_id, &receipt_path.path)
             .map_err(|error| invalid(format!("completed primary receipt is invalid: {error}")))?
     };
     if graph_receipt.seal.disposition != ClosureDisposition::Closed
