@@ -231,7 +231,6 @@ fn work_is_open(item: &WorkAssignment) -> bool {
 fn evictable_work_index(work: &[WorkAssignment], protected_id: Option<&str>) -> Option<usize> {
     work.iter().position(|item| {
         !work_is_open(item)
-            && item.status != "needs_route"
             && !needs_work_update(item)
             && protected_id != Some(item.id.as_str())
             && !work.iter().any(|child| {
@@ -829,7 +828,7 @@ fn read_control(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result<Cont
         || state.work.iter().any(|item| {
             !matches!(
                 item.status.as_str(),
-                "pending" | "awaiting_resolution" | "completed" | "held" | "needs_route"
+                "pending" | "awaiting_resolution" | "completed" | "held"
             ) || (item.status == "awaiting_resolution") != item.pending_resolution.is_some()
                 || item.pending_resolution.as_ref().is_some_and(|pending| {
                     item.runs.get(&pending.skill).map(|run| run.run_id.as_str())
@@ -839,11 +838,8 @@ fn read_control(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result<Cont
                 || item.parent_work_id.as_ref().is_some_and(|id| id.len() > 80)
                 || item.source_ref.len() > 300
                 || item.target_ref.len() > 300
-                || (item.status == "needs_route"
-                    && (item.receipt.is_none() || item.result_ref.is_none()))
                 || item.private_update_status.as_deref().is_some_and(|status| {
-                    !matches!(status, "local_only" | "delivered")
-                        || !matches!(item.status.as_str(), "completed" | "needs_route")
+                    !matches!(status, "local_only" | "delivered") || item.status != "completed"
                 })
         })
     {
@@ -912,7 +908,7 @@ fn work_result_digest(item: &WorkAssignment) -> Option<String> {
 }
 
 fn needs_work_update(item: &WorkAssignment) -> bool {
-    matches!(item.status.as_str(), "completed" | "needs_route")
+    item.status == "completed"
         && item.private_update_status.is_none()
         && item.receipt.is_some()
         && item.result_ref.is_some()
@@ -935,7 +931,7 @@ fn work_update_item(workspace: &WorkspaceEnv, item: &WorkAssignment) -> Result<V
                 .ok_or("conversation work lacks status")?;
             let prefix = match status {
                 "reply" => "Unsent reply draft",
-                "follow_up" => "Follow-up retained; execution route needed",
+                "follow_up" => "Follow-up proposed but not queued",
                 "needs_context" => "Conversation needs context",
                 "no_action" => "Conversation needs no action",
                 _ => return Err("conversation work has an invalid outcome".to_owned()),
@@ -1092,7 +1088,6 @@ pub(super) fn status(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result
         "last_fresh_scan_at_unix_seconds":record.state.last_fresh_scan_at,
         "confirmed_memory_count":record.state.confirmed_memory.len(),
         "pending_work_count":record.state.work.iter().filter(|item| item.status == "pending").count(),
-        "unrouted_outcome_count":record.state.work.iter().filter(|item| item.status == "needs_route").count(),
         "awaiting_resolution_count":record.state.work.iter().filter(|item| item.status == "awaiting_resolution").count(),
         "pending_private_work_updates":pending_work_update_indices(&record.state.work).len(),
         "report_available":record.state.last_review_ref.is_some(),
@@ -1124,7 +1119,7 @@ pub(super) fn report(loaded: &LoadedProfile, workspace: &WorkspaceEnv) -> Result
         "current_profile_revision":loaded.revision,
         "attention_packet":review.packet,
         "receipt":review.receipt,
-        "recent_work":record.state.work.iter().rev().filter(|item| matches!(item.status.as_str(), "completed" | "needs_route")).take(5).collect::<Vec<_>>()
+        "recent_work":record.state.work.iter().rev().filter(|item| item.status == "completed").take(5).collect::<Vec<_>>()
     }))
 }
 
@@ -1995,7 +1990,7 @@ fn review_observations(
         .work
         .iter()
         .filter(|work| {
-            matches!(work.status.as_str(), "completed" | "needs_route")
+            work.status == "completed"
                 && observations
                     .iter()
                     .any(|item| item["source_digest"] == work.source_digest)
@@ -2023,8 +2018,6 @@ fn review_observations(
                     "kind":"conversation_review",
                     "summary":result["summary"],
                     "status":result["status"],
-                    "follow_up_status":result["follow_up_status"],
-                    "work_status":work.status,
                     "source_complete":result["source_complete"],
                     "checked_at":result["checked_at"],
                     "receipt":receipt,
@@ -2092,7 +2085,7 @@ fn review_observations(
     let mut candidates = work_candidates(loaded, observations);
     candidates.retain(|candidate| {
         !record.state.work.iter().any(|work| {
-            matches!(work.status.as_str(), "completed" | "needs_route")
+            work.status == "completed"
                 && candidate["source_digest"] == work.source_digest
                 && candidate["route_id"] == work.route_id
                 && candidate["target_ref"] == work.target_ref
@@ -2562,7 +2555,7 @@ fn dispatch_pending_work(
             );
         }
     }
-    let (mut result, receipt) = match route.kind.as_str() {
+    let (result, receipt) = match route.kind.as_str() {
         "github_pr_status" => run_pr_status(loaded, workspace, record, index, &item, route)?,
         "conversation_review" => {
             let memory = record.state.confirmed_memory.clone();
@@ -2593,28 +2586,7 @@ fn dispatch_pending_work(
     } else {
         None
     };
-    let outcome_needs_route = result["kind"] == "conversation_review"
-        && result["status"] == "follow_up";
-    if outcome_needs_route {
-        result["follow_up_task"]
-            .as_str()
-            .filter(|task| !task.trim().is_empty() && task.len() <= 1000)
-            .ok_or_else(|| {
-                SkillRunStop::sealed_validation(
-                    "conversation-review",
-                    &receipt,
-                    "follow-up has no bounded desired outcome",
-                )
-            })?;
-        result["follow_up_status"] = json!("admitted_needs_route");
-        result["effect_status"] = json!("unrouted_outcome");
-    }
-    record.state.work[index].status = if outcome_needs_route {
-        "needs_route"
-    } else {
-        "completed"
-    }
-    .to_owned();
+    record.state.work[index].status = "completed".to_owned();
     record.state.work[index].receipt = Some(receipt.clone());
     record.state.work[index].result_ref = Some(persist_work_result(workspace, &item, &result)?);
     record.state.work[index].runs.clear();
@@ -2632,18 +2604,8 @@ fn dispatch_pending_work(
         record.state.work.push(child);
     }
     record.state.last_blocker = None;
-    write_control(
-        loaded,
-        workspace,
-        record,
-        if outcome_needs_route { "work_needs_route" } else { "work_completed" },
-    )?;
-    Ok(json!({
-        "status":if outcome_needs_route { "work_needs_route" } else { "work_completed" },
-        "work_id":item.id,
-        "receipt":receipt,
-        "result":result
-    }))
+    write_control(loaded, workspace, record, "work_completed")?;
+    Ok(json!({"status":"work_completed","work_id":item.id,"receipt":receipt,"result":result}))
 }
 
 fn run_pr_status(
@@ -3547,10 +3509,10 @@ fn prepare_notification(
                 .iter()
                 .find(|work| {
                     work.id == id
-                        && matches!(work.status.as_str(), "completed" | "needs_route")
+                        && work.status == "completed"
                         && work.private_update_status.is_none()
                 })
-                .ok_or("work update is not a pending sealed assignment")?;
+                .ok_or("work update is not a pending completed assignment")?;
             if item["source_digest"].as_str() != work_result_digest(assignment).as_deref()
                 || item["receipt"].as_str() != assignment.receipt.as_deref()
             {
@@ -3718,9 +3680,7 @@ fn deliver_pending(
             .work
             .iter_mut()
             .find(|work| {
-                work.id == *id
-                    && matches!(work.status.as_str(), "completed" | "needs_route")
-                    && work.private_update_status.is_none()
+                work.id == *id && work.status == "completed" && work.private_update_status.is_none()
             })
             .ok_or("delivered work update lacks pending assignment")?;
         if !pending

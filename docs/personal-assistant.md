@@ -177,12 +177,7 @@ second time. The worker rereads one exact recorded Slack or Nitrosend
 thread through its owning skill, checks its identity against the current open
 operator-inbox action, and calls `conversation-review` with the private charter
 and confirmed context. Ordinary correspondence produces an unsent draft or
-a follow-up proposal. The worker retains a follow-up as an unsatisfied desired
-outcome on the review assignment, reports `work_needs_route`, and
-exposes the exact task in `assistant work`. It does not schedule or execute that
-outcome until a governed route takes ownership; `status.unrouted_outcome_count`
-shows how many such outcomes still need routing. These assignments are not
-evicted to make room for newer work.
+an unscheduled follow-up proposal; the current worker does not execute it.
 Only a complete thread classified as a real coding request,
 with a verbatim request quote, enters `issue-intake`; its change set may then
 enter `work-plan`. The source and decision receipts and bounded result appear
