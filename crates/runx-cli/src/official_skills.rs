@@ -17,7 +17,7 @@ pub(crate) const OFFICIAL_SKILLS: &[OfficialSkillLockEntry] = &[
     },
     OfficialSkillLockEntry {
         skill_id: "runx/agency",
-        version: "sha-db8ed23b058e",
+        version: "sha-90c8f606c306",
         digest: "b89c523d608130a72180c97eafb5f979bf52dcc5948394c853efc99f26f6b27c",
     },
     OfficialSkillLockEntry {
