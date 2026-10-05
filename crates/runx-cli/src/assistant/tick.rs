@@ -3925,32 +3925,52 @@ mod tests {
             &SkillRunFailure {
                 message: "model failed".to_owned(),
                 terminal_receipt: Some("sha256:failed".to_owned()),
-                skill: Some("conversation-review".to_owned()),
+                skill: Some("issue-intake".to_owned()),
             },
             15,
         );
         assert_eq!(work.status, "held");
         assert_eq!(work.receipt.as_deref(), Some("sha256:failed"));
         work.runs.insert(
-            "conversation-review".to_owned(),
+            "issue-intake".to_owned(),
             super::BoundWorkRun {
                 run_id: "run_old".to_owned(),
                 package_digest: "sha256:old".to_owned(),
                 input_ref: json!(null),
             },
         );
-        let current = BTreeMap::from([("conversation-review".to_owned(), "sha256:old".to_owned())]);
+        work.runs.insert(
+            "conversation-review".to_owned(),
+            super::BoundWorkRun {
+                run_id: "run_completed_phase".to_owned(),
+                package_digest: "sha256:completed".to_owned(),
+                input_ref: json!({"artifact":"completed-phase-inputs"}),
+            },
+        );
+        let current = BTreeMap::from([("issue-intake".to_owned(), "sha256:old".to_owned())]);
         assert!(!refresh_failed_work_after_patch(
             std::slice::from_mut(&mut work),
             &current
         ));
-        let patched = BTreeMap::from([("conversation-review".to_owned(), "sha256:new".to_owned())]);
+        let unrelated_patch = BTreeMap::from([
+            ("issue-intake".to_owned(), "sha256:old".to_owned()),
+            ("conversation-review".to_owned(), "sha256:new".to_owned()),
+        ]);
+        assert!(!refresh_failed_work_after_patch(
+            std::slice::from_mut(&mut work),
+            &unrelated_patch
+        ));
+        let patched = BTreeMap::from([("issue-intake".to_owned(), "sha256:new".to_owned())]);
         assert!(refresh_failed_work_after_patch(
             std::slice::from_mut(&mut work),
             &patched
         ));
         assert_eq!(work.status, "pending");
-        assert!(work.runs.is_empty());
+        assert!(!work.runs.contains_key("issue-intake"));
+        assert_eq!(
+            work.runs["conversation-review"].run_id,
+            "run_completed_phase"
+        );
         assert!(work.receipt.is_none());
 
         apply_assignment_failure(
