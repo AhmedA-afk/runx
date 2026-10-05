@@ -234,7 +234,8 @@ coverage caveat in the exact posted text. `revoke` disables the standing
 authority. Quiet hours defer a pending notification; read-only checks can
 continue during quiet hours even while notification is pending.
 The local host projects each selected item into a short, plain-text notification
-with its full source digest, within the channel's byte quota. The complete
+with its full source digest, or the sealed receipt for completed work, within
+the channel's byte quota. The complete
 evidence-bound review, including exact source locators, remains available through
 `report`; sealed assignment results remain in `assistant work`. A work update
 is marked delivered only after provider readback matches its pinned intent.

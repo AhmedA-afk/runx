@@ -3335,14 +3335,20 @@ fn private_notification_text(
             let source_digest = item["source_digest"]
                 .as_str()
                 .ok_or("selected item lacks source digest")?;
-            if !source_digest.starts_with("sha256:")
-                || source_digest.len() != 71
-                || !source_digest[7..]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
-            {
+            if !valid_sha256_digest(source_digest) {
                 return Err("selected item has invalid source digest".to_owned());
             }
+            let (label, reference_kind, reference) = if item["source_kind"] == "work_result" {
+                let receipt = item["receipt"]
+                    .as_str()
+                    .ok_or("completed work update lacks receipt")?;
+                if !valid_sha256_digest(receipt) {
+                    return Err("completed work update has invalid receipt".to_owned());
+                }
+                ("WORK", "receipt", receipt)
+            } else {
+                (priority, "source", source_digest)
+            };
             let mut end = 0;
             for (index, character) in summary.char_indices() {
                 if index + character.len_utf8() > summary_bytes {
@@ -3351,13 +3357,8 @@ fn private_notification_text(
                 end = index + character.len_utf8();
             }
             let suffix = if end < summary.len() { "…" } else { "" };
-            let label = if item["source_kind"] == "work_result" {
-                "WORK"
-            } else {
-                priority
-            };
             compact.push_str(&format!(
-                "\n{}: {}{} (source {source_digest})",
+                "\n{}: {}{} ({reference_kind} {reference})",
                 label.to_uppercase(),
                 &summary[..end],
                 suffix
@@ -3378,6 +3379,12 @@ fn private_notification_text(
         }
     }
     Err("brief and exact source references exceed configured notification limit".to_owned())
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.starts_with("sha256:")
+        && value.len() == 71
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn has_active_notification_mention(text: &str) -> bool {
@@ -4426,7 +4433,7 @@ mod tests {
             "id":"work-1", "source_ref":"slack://message", "source_digest":"digest",
             "thread_locator":"slack://thread", "route_id":"intake",
             "target_ref":"slack://thread", "status":"completed",
-            "receipt":"sha256:receipt", "result_ref":null
+            "receipt":format!("sha256:{}", "a".repeat(64)), "result_ref":null
         }))
         .map_err(|error| error.to_string())?;
         let result = json!({"kind":"coding_intake","summary":"Check the bounded request","change_set":{"summary":"private context"}});
@@ -4443,6 +4450,11 @@ mod tests {
             false,
         )?;
         assert!(text.contains("WORK: Coding request triaged; no code changed"));
+        assert!(text.contains(&format!("receipt sha256:{}", "a".repeat(64))));
+        assert!(!text.contains(&format!(
+            "source {}",
+            update["source_digest"].as_str().unwrap_or_default()
+        )));
         assert!(text.contains("runx assistant work"));
         item.private_update_status = Some("local_only".to_owned());
         assert!(super::pending_work_update_indices(&[item.clone()]).is_empty());
