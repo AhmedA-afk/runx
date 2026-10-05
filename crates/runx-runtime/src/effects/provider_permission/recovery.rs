@@ -27,11 +27,13 @@ pub(super) struct ProviderRecoveryContext {
 }
 
 impl ProviderRecoveryContext {
+    pub(super) fn store_root(&self) -> &Path {
+        &self.store_root
+    }
     pub(super) fn previous_attempt(&self) -> Option<u32> {
         self.previous_attempt
     }
 
-    #[cfg(any(feature = "catalog", test))]
     pub(super) fn cached_readback(&self) -> Option<&JsonObject> {
         self.cached_readback.as_ref()
     }
@@ -314,7 +316,7 @@ fn validate_entry_for_plan(
     resolved: &ProviderEffectResolved,
 ) -> Result<(), RuntimeEffectError> {
     validate_entry_shape(entry)?;
-    let expected_idempotency = format!("runx:{}", resolved.plan_digest());
+    let expected_idempotency = resolved.provider_idempotency_key();
     let intent = resolved.intent();
     if entry.plan_digest != resolved.plan_digest()
         || entry.idempotency_key != expected_idempotency

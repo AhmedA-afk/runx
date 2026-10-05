@@ -32,11 +32,13 @@ Runx's native `data.digest`, and binds that digest, the named principal, and the
 send intent through the canonical `send-as` planning model. It does not post
 and needs no approval. Delivery still requires the exact connector locator.
 
+`plan_exact` is for an operator that has already selected one exact Slack destination, principal, and text under its own policy. It reuses the same notification validation and native digest, then emits the same undelivered `runx.notify.v1` plan without a second model judgment. Its `send_plan.origin` is `slack-notify.exact`, not a claim that `send-as#plan` ran. It does not authorize delivery: `deliver` still requires a matching native human approval or a configured standing notification authority and independent readback.
+
 `deliver` accepts only that exact plan, the matching destination and message
 text, and a stable UUID idempotency key. Runx recomputes the digest and compares
 the complete delivery binding without echoing message content. It then:
 
-1. stops at explicit human approval;
+1. stops unless exact native human approval or a matching standing notification authority is present;
 2. resolves the configured provider binding for `channel.post` and the
    follow-up `channel.post.read`;
 3. asks the selected provider transport to execute that bounded mutation while
@@ -51,8 +53,8 @@ stores connector credentials in its inputs or receipts.
 
 ## Inputs and result
 
-Planning needs the principal, exact Slack locator, message text, purpose, and
-any audience constraints required by `send-as`. Delivery needs the resulting
+Generic planning needs the principal, exact Slack locator, message text, purpose, and
+any audience constraints required by `send-as`. Exact planning needs only the fixed principal, locator, and content; the caller owns the prior selection. Delivery needs the resulting
 `notify_plan`, identical locator and text, and stable idempotency key.
 
 A plan ends as not sent. A delivery is valid only when the sealed
@@ -66,7 +68,7 @@ enough.
 ## Stop conditions
 
 - Stop on plan, destination, content-digest, principal, or audience drift.
-- Stop when approval is absent or denied.
+- Stop when both human approval and standing notification authority are absent or denied.
 - Refuse a missing, ambiguous, wrong-provider, or insufficient-scope Slack
   binding for either operation rather than falling back to a raw token.
 - Replays may reuse the same idempotency binding only for the exact same post;

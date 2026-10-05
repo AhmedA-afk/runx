@@ -120,8 +120,15 @@ pub(super) fn connection<I>(
             error,
         )
     })?;
+    if binding.private_local_source {
+        // Restrict the directory before SQLite can create a database or WAL sidecar.
+        restrict_local_source(tool, parent, &path)?;
+    }
     let mut connection = Connection::open(&path)
         .map_err(|error| database_error(tool, &format!("opening {}", path.display()), error))?;
+    if binding.private_local_source {
+        restrict_local_source_file(tool, &path)?;
+    }
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| database_error(tool, "setting SQLite busy timeout", error))?;
@@ -132,6 +139,7 @@ pub(super) fn connection<I>(
 
 struct SqliteBinding<'a> {
     database_path: &'a str,
+    private_local_source: bool,
 }
 
 impl<'a> SqliteBinding<'a> {
@@ -164,8 +172,64 @@ impl<'a> SqliteBinding<'a> {
         required("data_source_ref")?;
         Ok(Self {
             database_path: required("database_path")?,
+            private_local_source: binding.get("profile").and_then(JsonValue::as_str)
+                == Some("local-durable"),
         })
     }
+}
+
+#[cfg(unix)]
+fn restrict_local_source(
+    tool: &str,
+    parent: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        RuntimeError::io(
+            format!("restricting data directory {}", parent.display()),
+            error,
+        )
+    })?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => restrict_local_source_file(tool, path),
+        Ok(_) => Err(invalid_input(
+            tool,
+            "local SQLite source must be a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RuntimeError::io(
+            format!("checking local SQLite source {}", path.display()),
+            error,
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn restrict_local_source_file(_tool: &str, path: &std::path::Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        RuntimeError::io(
+            format!("restricting local SQLite source {}", path.display()),
+            error,
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_local_source(
+    _tool: &str,
+    _parent: &std::path::Path,
+    _path: &std::path::Path,
+) -> Result<(), RuntimeError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_local_source_file(_tool: &str, _path: &std::path::Path) -> Result<(), RuntimeError> {
+    Ok(())
 }
 
 fn ensure_wal(tool: &str, connection: &Connection) -> Result<(), RuntimeError> {

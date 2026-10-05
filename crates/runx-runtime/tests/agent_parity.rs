@@ -597,7 +597,9 @@ fn config() -> ManagedAgentConfig {
     ManagedAgentConfig {
         provider: managed_agent_provider::OPENAI.into(),
         model: "gpt-test".to_owned(),
-        api_key: SecretString::new("sk-test"),
+        api_key: Some(SecretString::new("sk-test")),
+        endpoint_url: None,
+        auth_mode: runx_runtime::ManagedAgentAuthMode::ApiKey,
     }
 }
 

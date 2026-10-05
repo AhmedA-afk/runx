@@ -5,6 +5,7 @@ use runx_contracts::{
 
 use super::contract::ProviderApprovalRequest;
 use super::policy::{ProviderPermissionPlan, provider_permission_policy_error};
+use super::standing::{NotificationIntent, reserve_notification};
 use super::{
     PROVIDER_PERMISSION_EFFECT_FAMILY, PROVIDER_PERMISSION_PAID_EXTERNAL_JOB_AUTHORITY_ENV,
     ProviderNativeAccess, ProviderPermissionAdmission,
@@ -181,6 +182,63 @@ pub(super) fn prepare_provider_execution(
     let Some(resolved) = context.provider_effect.clone() else {
         return Ok(EffectPreparationOutcome::Ready(Box::new(admission)));
     };
+    if let Some(notification) = context.notification_request.as_ref() {
+        let recovery = context
+            .recovery
+            .as_ref()
+            .ok_or_else(|| RuntimeEffectError::Failed {
+                family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+                operation: "prepare notification authority",
+                message: "provider recovery context is missing".to_owned(),
+            })?;
+        if recovery.previous_attempt().is_some()
+            && recovery.approval_actor() != Some("standing_notification")
+        {
+            return Err(RuntimeEffectError::Denied {
+                family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+                verb: AuthorityVerb::Write,
+                message: "notification recovery changed its authority lane".to_owned(),
+            });
+        }
+        let idempotency_key = resolved.provider_idempotency_key();
+        let proof = reserve_notification(
+            recovery.store_root(),
+            &NotificationIntent {
+                authority_id: &notification.authority_id,
+                provider_grant_id: resolved.authority().grant_id(),
+                principal_ref: resolved.authority().principal_ref(),
+                target: resolved.intent().target(),
+                source_set_digest: &notification.source_set_digest,
+                plan_digest: resolved.plan_digest(),
+                idempotency_key: &idempotency_key,
+                run_id: &notification.run_id,
+                text: &notification.text,
+            },
+            recovery.cached_readback().is_some(),
+        )
+        .map_err(|error| match error {
+            super::standing::NotificationAuthorityError::Store(_) => RuntimeEffectError::Failed {
+                family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+                operation: "reserve notification authority",
+                message: error.to_string(),
+            },
+            _ => RuntimeEffectError::Denied {
+                family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+                verb: AuthorityVerb::Write,
+                message: error.to_string(),
+            },
+        })?;
+        if recovery.previous_attempt().is_some()
+            && recovery.approval_key() != Some(proof.approval_key.as_str())
+        {
+            return Err(RuntimeEffectError::Denied {
+                family: PROVIDER_PERMISSION_EFFECT_FAMILY.to_owned(),
+                verb: AuthorityVerb::Write,
+                message: "notification recovery changed its authority lane".to_owned(),
+            });
+        }
+        context.notification_proof = Some(proof);
+    }
     let approval = if resolved.intent().requires_approval() {
         let request = context.approval_request.as_ref().ok_or_else(|| {
             RuntimeEffectError::InvalidMetadata {
@@ -189,7 +247,13 @@ pub(super) fn prepare_provider_execution(
                     .to_owned(),
             }
         })?;
-        if let Some(authority) = context.mutation_authority.as_ref() {
+        if let Some(proof) = context.notification_proof.as_ref() {
+            Some(ProviderApprovalEvidence {
+                actor: "standing_notification".to_owned(),
+                approval_key: proof.approval_key.clone(),
+                plan_digest: resolved.plan_digest().to_owned(),
+            })
+        } else if let Some(authority) = context.mutation_authority.as_ref() {
             Some(authority.approval(&resolved))
         } else if let Some(recovery) = context.recovery.as_ref()
             && let Some(approval_key) = recovery.approval_key()
@@ -351,10 +415,10 @@ pub(super) fn prepare_provider_effect_output(
             provider_proof_reference(
                 format!("runx:provider_approval:{approval_key}"),
                 provider,
-                if attempt.approval_actor() == Some("paid_external_job") {
-                    "paid external-job provider authority"
-                } else {
-                    "exact provider approval"
+                match attempt.approval_actor() {
+                    Some("paid_external_job") => "paid external-job provider authority",
+                    Some("standing_notification") => "standing notification authority",
+                    _ => "exact provider approval",
                 },
                 ProofKind::EffectEvidence,
             ),
@@ -372,6 +436,17 @@ pub(super) fn prepare_provider_effect_output(
                 reference,
             )?;
         }
+    }
+    if let Some(proof) = context.notification_proof.as_ref() {
+        crate::effects::insert_effect_verification_ref(
+            &mut request.output.metadata,
+            provider_proof_reference(
+                format!("runx:notification_authority:{}", proof.authority_id),
+                provider,
+                "bounded standing notification authority",
+                ProofKind::EffectEvidence,
+            ),
+        )?;
     }
     if attempt.resolved().intent().class() == ProviderEffectClass::Mutation {
         let operation_id = required_provider_output_field(operation, "operation_id")?;

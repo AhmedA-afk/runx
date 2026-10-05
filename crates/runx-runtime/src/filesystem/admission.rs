@@ -148,6 +148,21 @@ pub(super) fn admit_file_target(
     if normalized.as_os_str().is_empty() {
         return Err(invalid_bundle(operation, "bundle path must name a file"));
     }
+    if normalized.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        [
+            crate::receipts::store::NOTIFICATION_AUTHORITY_STATE_FILE_NAME,
+            crate::receipts::store::PROVIDER_EFFECT_STATE_FILE_NAME,
+            crate::receipts::store::STORE_LOCK_FILE_NAME,
+        ]
+        .iter()
+        .any(|protected| name == *protected || name.starts_with(&format!(".{protected}.tmp.")))
+    }) {
+        return Err(invalid_bundle(
+            operation,
+            "native receipt authority state cannot be changed by a file tool",
+        ));
+    }
     let relative = normalized
         .components()
         .map(|component| component.as_os_str().to_string_lossy())

@@ -24,8 +24,9 @@ use super::seal::{RuntimeReceiptProofContextProvider, RuntimeReceiptSignaturePol
 const RECEIPT_STORE_INDEX_SCHEMA: &str = "runx.receipt_store_index.v1";
 const INDEX_FILE_NAME: &str = "index.json";
 const EFFECT_STATE_FILE_NAME: &str = "effect-state.json";
-const PROVIDER_EFFECT_STATE_FILE_NAME: &str = "provider-effects.json";
-const STORE_LOCK_FILE_NAME: &str = ".receipt-store.lock";
+pub(crate) const PROVIDER_EFFECT_STATE_FILE_NAME: &str = "provider-effects.json";
+pub(crate) const NOTIFICATION_AUTHORITY_STATE_FILE_NAME: &str = "notification-authorities.json";
+pub(crate) const STORE_LOCK_FILE_NAME: &str = ".receipt-store.lock";
 const SHA256_RECEIPT_ID_PREFIX: &str = "sha256:";
 const SHA256_RECEIPT_FILE_PREFIX: &str = "sha256-";
 
@@ -184,13 +185,29 @@ impl LocalReceiptStore {
     where
         T: DeserializeOwned,
     {
+        self.read_private_state(PROVIDER_EFFECT_STATE_FILE_NAME)
+    }
+
+    pub(crate) fn read_notification_authority_state<T>(
+        &self,
+    ) -> Result<Option<T>, ReceiptStoreError>
+    where
+        T: DeserializeOwned,
+    {
+        self.read_private_state(NOTIFICATION_AUTHORITY_STATE_FILE_NAME)
+    }
+
+    fn read_private_state<T>(&self, file_name: &str) -> Result<Option<T>, ReceiptStoreError>
+    where
+        T: DeserializeOwned,
+    {
         match self.ensure_store_dir() {
             Ok(()) => {}
             Err(ReceiptStoreError::MissingStore { .. }) => return Ok(None),
             Err(error) => return Err(error),
         }
         let _lock = self.lock_mutations()?;
-        let path = self.root.join(PROVIDER_EFFECT_STATE_FILE_NAME);
+        let path = self.root.join(file_name);
         let contents = match fs::read(&path) {
             Ok(contents) => contents,
             Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
@@ -213,9 +230,30 @@ impl LocalReceiptStore {
     where
         T: Default + DeserializeOwned + Serialize,
     {
+        self.update_private_state(PROVIDER_EFFECT_STATE_FILE_NAME, update)
+    }
+
+    pub(crate) fn update_notification_authority_state<T, R>(
+        &self,
+        update: impl FnOnce(&mut T) -> Result<R, ReceiptStoreError>,
+    ) -> Result<R, ReceiptStoreError>
+    where
+        T: Default + DeserializeOwned + Serialize,
+    {
+        self.update_private_state(NOTIFICATION_AUTHORITY_STATE_FILE_NAME, update)
+    }
+
+    fn update_private_state<T, R>(
+        &self,
+        file_name: &str,
+        update: impl FnOnce(&mut T) -> Result<R, ReceiptStoreError>,
+    ) -> Result<R, ReceiptStoreError>
+    where
+        T: Default + DeserializeOwned + Serialize,
+    {
         self.ensure_or_create_store_dir()?;
         let _lock = self.lock_mutations()?;
-        let path = self.root.join(PROVIDER_EFFECT_STATE_FILE_NAME);
+        let path = self.root.join(file_name);
         let mut state = match fs::read(&path) {
             Ok(contents) => serde_json::from_slice(&contents).map_err(|source| {
                 ReceiptStoreError::MalformedEffectState {
@@ -235,7 +273,7 @@ impl LocalReceiptStore {
                 message: source.to_string(),
             }
         })?;
-        write_atomic(&self.root, PROVIDER_EFFECT_STATE_FILE_NAME, &contents)?;
+        write_atomic(&self.root, file_name, &contents)?;
         Ok(result)
     }
 

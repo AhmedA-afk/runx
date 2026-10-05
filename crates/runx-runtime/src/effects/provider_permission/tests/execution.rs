@@ -34,6 +34,8 @@ fn provider_tool_uses_only_its_current_step_admission() {
                 provider_effect: Some(test_provider_resolved(grant_id, ProviderNativeAccess::Read)),
                 approval_request: None,
                 mutation_authority: None,
+                notification_request: None,
+                notification_proof: None,
                 attempt: Some(test_provider_attempt(grant_id, ProviderNativeAccess::Read)),
                 recovery: None,
             },

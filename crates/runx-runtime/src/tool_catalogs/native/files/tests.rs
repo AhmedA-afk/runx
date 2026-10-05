@@ -5,7 +5,10 @@ use std::fs;
 
 use runx_contracts::{JsonObject, JsonValue};
 
-use super::{FileReadBundleInput, FileReadInput, FileWriteInput, read, read_bundle, write};
+use super::{
+    FileApplyBundleInput, FileReadBundleInput, FileReadInput, FileWriteInput, apply_files, read,
+    read_bundle, write,
+};
 #[cfg(feature = "catalog")]
 use crate::RuntimeEffectRegistry;
 use crate::credentials::CredentialDelivery;
@@ -190,6 +193,207 @@ fn writes_and_proves_one_contained_file() -> Result<(), Box<dyn std::error::Erro
             .and_then(JsonValue::as_str)
             .map(str::len),
         Some(64)
+    );
+    Ok(())
+}
+
+#[test]
+fn native_file_tools_cannot_change_receipt_authority_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let alternate = tempfile::tempdir()?;
+    let env = BTreeMap::from([(
+        RUNX_CWD_ENV.to_owned(),
+        workspace.path().to_string_lossy().into_owned(),
+    )]);
+    let delivery = CredentialDelivery::none();
+    #[cfg(feature = "catalog")]
+    let effects = RuntimeEffectRegistry::default();
+    for root in [workspace.path(), alternate.path()] {
+        for filename in [
+            "notification-authorities.json",
+            "provider-effects.json",
+            ".receipt-store.lock",
+            ".notification-authorities.json.tmp.123-456",
+            ".provider-effects.json.tmp.123-456",
+        ] {
+            let path = format!("receipts/{filename}");
+            let protected = root.join(&path);
+            fs::create_dir_all(protected.parent().ok_or("missing parent")?)?;
+            fs::write(&protected, "protected")?;
+            let repo_root = root.to_string_lossy().into_owned();
+            let write_inputs = fixture_input::<FileWriteInput>(JsonObject::from([
+                ("repo_root".to_owned(), JsonValue::String(repo_root.clone())),
+                ("path".to_owned(), JsonValue::String(path.clone())),
+                (
+                    "contents".to_owned(),
+                    JsonValue::String("forged".to_owned()),
+                ),
+            ]))?;
+            assert!(
+                write(&NativeInvocation {
+                    inputs: &write_inputs,
+                    observed_at: "2026-01-01T00:00:00Z",
+                    data_source_binding: None,
+                    env: &env,
+                    skill_directory: workspace.path(),
+                    credential_delivery: &delivery,
+                    local_artifacts: crate::tool_catalogs::native::fixture_local_artifacts(),
+                    #[cfg(feature = "catalog")]
+                    effects: &effects,
+                })
+                .is_err()
+            );
+            for (writes, deletes) in [
+                (
+                    vec![JsonValue::Object(JsonObject::from([
+                        ("path".to_owned(), JsonValue::String(path.clone())),
+                        (
+                            "contents".to_owned(),
+                            JsonValue::String("forged".to_owned()),
+                        ),
+                    ]))],
+                    Vec::new(),
+                ),
+                (Vec::new(), vec![JsonValue::String(path.clone())]),
+            ] {
+                let bundle_inputs = fixture_input::<FileApplyBundleInput>(JsonObject::from([
+                    ("repo_root".to_owned(), JsonValue::String(repo_root.clone())),
+                    ("writes".to_owned(), JsonValue::Array(writes)),
+                    ("deletes".to_owned(), JsonValue::Array(deletes)),
+                ]))?;
+                assert!(
+                    apply_files(&NativeInvocation {
+                        inputs: &bundle_inputs,
+                        observed_at: "2026-01-01T00:00:00Z",
+                        data_source_binding: None,
+                        env: &env,
+                        skill_directory: workspace.path(),
+                        credential_delivery: &delivery,
+                        local_artifacts: crate::tool_catalogs::native::fixture_local_artifacts(),
+                        #[cfg(feature = "catalog")]
+                        effects: &effects,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(fs::read_to_string(&protected)?, "protected");
+            fs::remove_file(&protected)?;
+            assert!(
+                write(&NativeInvocation {
+                    inputs: &write_inputs,
+                    observed_at: "2026-01-01T00:00:00Z",
+                    data_source_binding: None,
+                    env: &env,
+                    skill_directory: workspace.path(),
+                    credential_delivery: &delivery,
+                    local_artifacts: crate::tool_catalogs::native::fixture_local_artifacts(),
+                    #[cfg(feature = "catalog")]
+                    effects: &effects,
+                })
+                .is_err()
+            );
+            assert!(!protected.exists());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn file_tool_cannot_replace_lock_while_native_revocation_waits()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use fs2::FileExt;
+
+    use crate::{
+        NotificationAuthorityGrant, NotificationAuthorityGrantSpec, install_notification_authority,
+        notification_authority_status, revoke_notification_authority,
+    };
+
+    let workspace = tempfile::tempdir()?;
+    let receipt_dir = workspace.path().join("receipts");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    install_notification_authority(
+        &receipt_dir,
+        NotificationAuthorityGrant::new(NotificationAuthorityGrantSpec {
+            authority_id: "test-authority".to_owned(),
+            provider_grant_id: "provider-grant".to_owned(),
+            principal_ref: "runx:principal:test".to_owned(),
+            target: "slack://T123/C456".to_owned(),
+            source_set_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            expires_at_unix_seconds: now + 3600,
+            max_posts_total: 1,
+            max_posts_per_day: 1,
+            max_text_bytes: 400,
+        })?,
+    )?;
+    let lock_path = receipt_dir.join(".receipt-store.lock");
+    let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    lock.lock_exclusive()?;
+    let original_inode = fs::metadata(&lock_path)?.ino();
+
+    let started = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+    let worker_root = receipt_dir.clone();
+    let worker_started = Arc::clone(&started);
+    let worker = std::thread::spawn(move || {
+        worker_started.wait();
+        let result = revoke_notification_authority(&worker_root, "test-authority");
+        let _ignored = sender.send(result);
+    });
+    started.wait();
+
+    let env = BTreeMap::from([(
+        RUNX_CWD_ENV.to_owned(),
+        workspace.path().to_string_lossy().into_owned(),
+    )]);
+    let delivery = CredentialDelivery::none();
+    #[cfg(feature = "catalog")]
+    let effects = RuntimeEffectRegistry::default();
+    let inputs = fixture_input::<FileApplyBundleInput>(JsonObject::from([
+        (
+            "repo_root".to_owned(),
+            JsonValue::String(workspace.path().to_string_lossy().into_owned()),
+        ),
+        ("writes".to_owned(), JsonValue::Array(Vec::new())),
+        (
+            "deletes".to_owned(),
+            JsonValue::Array(vec![JsonValue::String(
+                "receipts/.receipt-store.lock".to_owned(),
+            )]),
+        ),
+    ]))?;
+    assert!(
+        apply_files(&NativeInvocation {
+            inputs: &inputs,
+            observed_at: "2026-01-01T00:00:00Z",
+            data_source_binding: None,
+            env: &env,
+            skill_directory: workspace.path(),
+            credential_delivery: &delivery,
+            local_artifacts: crate::tool_catalogs::native::fixture_local_artifacts(),
+            #[cfg(feature = "catalog")]
+            effects: &effects,
+        })
+        .is_err()
+    );
+    assert_eq!(fs::metadata(&lock_path)?.ino(), original_inode);
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    FileExt::unlock(&lock)?;
+    receiver.recv_timeout(Duration::from_secs(3))??;
+    worker.join().map_err(|_| "revocation worker panicked")?;
+    assert_eq!(fs::metadata(&lock_path)?.ino(), original_inode);
+    assert!(
+        notification_authority_status(&receipt_dir, "test-authority")?
+            .ok_or("missing authority")?
+            .revoked_at_unix_seconds
+            .is_some()
     );
     Ok(())
 }

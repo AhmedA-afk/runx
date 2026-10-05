@@ -153,6 +153,8 @@ fn publish_harness_env(
     env.remove("RUNX_AGENT_PROVIDER");
     env.remove("RUNX_AGENT_MODEL");
     env.remove("RUNX_AGENT_API_KEY");
+    env.remove("RUNX_AGENT_ENDPOINT_URL");
+    env.remove("RUNX_AGENT_AUTH_MODE");
     env.insert(
         "RUNX_HOME".to_owned(),
         runx_home.to_string_lossy().into_owned(),
@@ -239,6 +241,11 @@ mod tests {
         let workspace_env = BTreeMap::from([
             ("RUNX_HOSTED_API_KEY".to_owned(), "hosted-secret".to_owned()),
             ("RUNX_AGENT_API_KEY".to_owned(), "agent-secret".to_owned()),
+            (
+                "RUNX_AGENT_ENDPOINT_URL".to_owned(),
+                "http://127.0.0.1:18081/v1/chat/completions".to_owned(),
+            ),
+            ("RUNX_AGENT_AUTH_MODE".to_owned(), "local_none".to_owned()),
             ("HTTP_PROXY".to_owned(), "http://proxy.test".to_owned()),
         ]);
         let env = publish_harness_env(
@@ -248,6 +255,8 @@ mod tests {
         );
         assert!(env.keys().all(|key| !key.starts_with("RUNX_HOSTED_")));
         assert!(!env.contains_key("RUNX_AGENT_API_KEY"));
+        assert!(!env.contains_key("RUNX_AGENT_ENDPOINT_URL"));
+        assert!(!env.contains_key("RUNX_AGENT_AUTH_MODE"));
         assert_eq!(
             env.get("HTTP_PROXY").map(String::as_str),
             Some("http://proxy.test")

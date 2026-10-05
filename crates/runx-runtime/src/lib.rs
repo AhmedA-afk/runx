@@ -54,6 +54,7 @@ pub mod registry;
 mod services;
 mod skill_package;
 mod time;
+pub use time::now_iso8601;
 pub mod tool_catalogs;
 
 pub use execution::harness;
@@ -80,13 +81,14 @@ pub use capability::{
     CapabilityEffect, CapabilityField, CapabilityInput, CapabilityOutput, TypedCapability,
 };
 pub use config::{
-    ConfigError, ConfigKey, ManagedAgentConfig, RunxAgentConfig, RunxConfigFile,
-    RunxCredentialProfile, RunxCredentialsConfig, RunxPublicConfig, load_local_agent_api_key,
-    load_local_credential_secret, load_local_public_api_token, load_managed_agent_config,
-    load_runx_config_file, lookup_runx_config_value, managed_agent_provider, mask_runx_config_file,
-    parse_config_key, remove_local_credential_secret, resolve_path_from_user_input,
-    resolve_runx_global_home_dir, resolve_runx_home_dir, resolve_runx_workspace_base,
-    store_local_credential_secret, update_runx_config_value, write_runx_config_file,
+    ConfigError, ConfigKey, ManagedAgentAuthMode, ManagedAgentConfig, RunxAgentConfig,
+    RunxConfigFile, RunxCredentialProfile, RunxCredentialsConfig, RunxPublicConfig,
+    clear_runx_agent_endpoint_url, load_local_agent_api_key, load_local_credential_secret,
+    load_local_public_api_token, load_managed_agent_config, load_runx_config_file,
+    lookup_runx_config_value, managed_agent_provider, mask_runx_config_file, parse_config_key,
+    remove_local_credential_secret, resolve_path_from_user_input, resolve_runx_global_home_dir,
+    resolve_runx_home_dir, resolve_runx_workspace_base, store_local_credential_secret,
+    update_runx_config_value, write_runx_config_file,
 };
 pub use credential_resolver::{
     CredentialBindingsFile, CredentialProfileSummary, ResolvedSkillCredential,
@@ -108,24 +110,28 @@ pub use dev::{
     discover_fixture_paths, render_dev_result, run_dev_once, should_ignore_dev_watch_path,
 };
 pub use doctor::{DoctorOptions, default_doctor_options, run_doctor};
+pub use effects::{
+    ASSISTANT_CONFIDENTIAL_TERMS_ENV, ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV, EffectAdmission,
+    EffectOutputRequest, EffectPreparationOutcome, EffectReceiptRequest, EffectReplay,
+    EffectReplayOutputRequest, EffectReplayReceiptRequest, EffectStepRequest, EffectToolRequest,
+    NOTIFICATION_AUTHORITY_ID_ENV, NOTIFICATION_SOURCE_SET_DIGEST_ENV, NotificationAuthorityError,
+    NotificationAuthorityGrant, NotificationAuthorityGrantSpec, NotificationAuthorityStatus,
+    PROVIDER_MUTATE_TOOL, PROVIDER_PERMISSION_EFFECT_FAMILY, PROVIDER_PERMISSION_GRANT_ID_ENV,
+    PROVIDER_PERMISSION_GRANTED_SCOPES_ENV, PROVIDER_PERMISSION_PAID_EXTERNAL_JOB_AUTHORITY_ENV,
+    PROVIDER_PERMISSION_PRINCIPAL_REF_ENV, PROVIDER_READ_TOOL, ProviderAcknowledgementEvidence,
+    ProviderApprovalEvidence, ProviderEffectAcknowledged, ProviderEffectAmount,
+    ProviderEffectAttempt, ProviderEffectAuthority, ProviderEffectClass, ProviderEffectError,
+    ProviderEffectFinality, ProviderEffectIntent, ProviderEffectIntentInput,
+    ProviderEffectReadback, ProviderEffectReadbackEvidence, ProviderEffectResolved,
+    ProviderEffectUnknown, ProviderPermissionAdmission, ProviderPermissionEffect,
+    ProviderScopeTransportError, RuntimeEffect, RuntimeEffectError, RuntimeEffectRegistry,
+    assistant_text_is_safe, decode_provider_scopes_env, encode_provider_scopes_env,
+    insert_effect_verification_ref, install_notification_authority, notification_authority_status,
+    notification_intent_has_reservation, revoke_notification_authority,
+};
 #[cfg(feature = "catalog")]
 pub use effects::{
     EXTERNAL_RECEIPT_EFFECT_FAMILY, EXTERNAL_RECEIPT_VERIFY_TOOL, ExternalReceiptEffect,
-};
-pub use effects::{
-    EffectAdmission, EffectOutputRequest, EffectPreparationOutcome, EffectReceiptRequest,
-    EffectReplay, EffectReplayOutputRequest, EffectReplayReceiptRequest, EffectStepRequest,
-    EffectToolRequest, PROVIDER_MUTATE_TOOL, PROVIDER_PERMISSION_EFFECT_FAMILY,
-    PROVIDER_PERMISSION_GRANT_ID_ENV, PROVIDER_PERMISSION_GRANTED_SCOPES_ENV,
-    PROVIDER_PERMISSION_PAID_EXTERNAL_JOB_AUTHORITY_ENV, PROVIDER_PERMISSION_PRINCIPAL_REF_ENV,
-    PROVIDER_READ_TOOL, ProviderAcknowledgementEvidence, ProviderApprovalEvidence,
-    ProviderEffectAcknowledged, ProviderEffectAmount, ProviderEffectAttempt,
-    ProviderEffectAuthority, ProviderEffectClass, ProviderEffectError, ProviderEffectFinality,
-    ProviderEffectIntent, ProviderEffectIntentInput, ProviderEffectReadback,
-    ProviderEffectReadbackEvidence, ProviderEffectResolved, ProviderEffectUnknown,
-    ProviderPermissionAdmission, ProviderPermissionEffect, ProviderScopeTransportError,
-    RuntimeEffect, RuntimeEffectError, RuntimeEffectRegistry, decode_provider_scopes_env,
-    encode_provider_scopes_env, insert_effect_verification_ref,
 };
 #[cfg(feature = "catalog")]
 pub use effects::{
@@ -153,8 +159,8 @@ pub use hosted_api::{
     store_authenticated_hosted_environment,
 };
 pub use http::{
-    HttpMethod, ReqwestHttpTransport, RuntimeHttpError, RuntimeHttpHeader, RuntimeHttpRequest,
-    RuntimeHttpResponse, RuntimeHttpTransport,
+    ExactLoopbackHttpTransport, HttpMethod, ReqwestHttpTransport, RuntimeHttpError,
+    RuntimeHttpHeader, RuntimeHttpRequest, RuntimeHttpResponse, RuntimeHttpTransport,
 };
 pub use init::{
     InitAction, InitError, InitGeneratedValues, RunxInitOptions, RunxInitResult, RunxInstallState,
@@ -220,7 +226,9 @@ pub use services::{
 };
 pub use skill_front::PackageHarnessReport;
 pub use skill_package::{
-    LoadedSkillPackage, SkillInspectionError, inspect_skill_package, load_validated_skill_package,
+    LoadedSkillPackage, SkillInspectionError, SkillRetentionError, inspect_local_skill_binding,
+    inspect_skill_package, load_validated_skill_package, resolve_retained_skill_binding,
+    retain_skill_binding,
 };
 pub use tool_catalogs::{
     ToolBuildOptions, ToolCatalogError, ToolInspectOptions, ToolSearchOptions, build_tool_catalogs,

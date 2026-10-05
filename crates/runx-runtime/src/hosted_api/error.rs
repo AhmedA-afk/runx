@@ -118,6 +118,16 @@ struct PlainErrorEnvelope {
 }
 
 #[derive(Deserialize)]
+struct FlatErrorEnvelope {
+    error: String,
+    code: String,
+    #[serde(default)]
+    hint: Option<String>,
+    #[serde(default)]
+    retry_after_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum PlainError {
     Message(String),
@@ -128,6 +138,16 @@ pub fn parse_hosted_api_error(body: &str) -> Option<HostedApiErrorPayload> {
     serde_json::from_str::<ErrorEnvelope>(body)
         .ok()
         .map(|envelope| envelope.error)
+        .or_else(|| {
+            serde_json::from_str::<FlatErrorEnvelope>(body)
+                .ok()
+                .map(|envelope| HostedApiErrorPayload {
+                    code: envelope.code,
+                    detail: envelope.error,
+                    hint: envelope.hint,
+                    retry_after_seconds: envelope.retry_after_seconds,
+                })
+        })
         .or_else(|| {
             serde_json::from_str::<PlainErrorEnvelope>(body)
                 .ok()

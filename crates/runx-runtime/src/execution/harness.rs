@@ -12,6 +12,8 @@ use runx_parser::SkillRunnerManifest;
 
 const AMBIENT_HARNESS_AUTHORITY_ENV: &[&str] = &[
     "RUNX_AGENT_API_KEY",
+    "RUNX_AGENT_ENDPOINT_URL",
+    "RUNX_AGENT_AUTH_MODE",
     "RUNX_HOSTED_CREDENTIAL_HANDLES_JSON",
     "RUNX_PUBLIC_API_ALLOW_PRIVATE_NETWORK",
     "RUNX_PUBLIC_API_BASE_URL",
@@ -102,6 +104,11 @@ runners:
                 "live-cloud-token".to_owned(),
             ),
             ("RUNX_AGENT_API_KEY".to_owned(), "live-agent-key".to_owned()),
+            (
+                "RUNX_AGENT_ENDPOINT_URL".to_owned(),
+                "http://127.0.0.1:18081/v1/chat/completions".to_owned(),
+            ),
+            ("RUNX_AGENT_AUTH_MODE".to_owned(), "local_none".to_owned()),
         ]);
 
         isolate_harness_environment(&mut env, [&manifest]);
@@ -116,6 +123,8 @@ runners:
         );
         assert!(!env.contains_key("RUNX_PUBLIC_API_TOKEN"));
         assert!(!env.contains_key("RUNX_AGENT_API_KEY"));
+        assert!(!env.contains_key("RUNX_AGENT_ENDPOINT_URL"));
+        assert!(!env.contains_key("RUNX_AGENT_AUTH_MODE"));
         Ok(())
     }
 }

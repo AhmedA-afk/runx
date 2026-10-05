@@ -84,7 +84,14 @@ pub(super) fn execute_agent_skill_run(
                         return seal_agent_failure(context, &run_id, AgentFailure::managed(&error));
                     }
                     InlineAgentOutcome::HostDrives => {
-                        super::state_store::write_agent_state(context, &run_id)?;
+                        super::state_store::write_agent_state(
+                            context,
+                            &run_id,
+                            super::PendingSkillRequest {
+                                id: request_id.clone(),
+                                value: resolution_request_value.clone(),
+                            },
+                        )?;
                         write_paused_agent_checkpoint(context, &run_id, &request_id)?;
                         return Ok(needs_agent_output(
                             context.manifest,
@@ -237,8 +244,7 @@ fn try_inline_agent_resolution(
     effects: &RuntimeEffectRegistry,
 ) -> Result<InlineAgentOutcome, SkillRunError> {
     use crate::adapters::agent::{AgentResolver, build_managed_agent_act_invocation};
-    use crate::adapters::agent_resolver::{AnthropicAgentResolver, AnthropicAgentResolverOptions};
-    use crate::http::ReqwestHttpTransport;
+    use crate::adapters::agent_resolver::{ManagedAgentResolver, ManagedAgentResolverOptions};
     use runx_contracts::ResolutionRequest;
 
     let Some((max_rounds, source_type, config)) = managed_agent_attempt(invocation, policy)? else {
@@ -250,14 +256,9 @@ fn try_inline_agent_resolution(
         id: agent_act.id.clone(),
         invocation: Box::new(agent_act),
     };
-    let transport = ReqwestHttpTransport::for_managed_agent().map_err(|error| {
-        SkillRunError::Invalid(format!("managed agent transport error: {error}"))
-    })?;
-    let resolver = AnthropicAgentResolver::new(
-        transport,
-        AnthropicAgentResolverOptions {
-            api_key: config.api_key,
-            model: config.model,
+    let resolver = ManagedAgentResolver::new(
+        config,
+        ManagedAgentResolverOptions {
             env: invocation.env.clone(),
             skill_directory: invocation.skill_directory.clone(),
             credential_delivery: invocation.credential_delivery.clone(),
@@ -294,9 +295,7 @@ fn managed_agent_attempt(
             .map_err(|error| {
                 SkillRunError::Invalid(format!("managed agent config error: {error}"))
             })?;
-    Ok(config
-        .filter(|config| config.provider.as_str().eq_ignore_ascii_case("anthropic"))
-        .map(|config| (max_rounds, source_type, config)))
+    Ok(config.map(|config| (max_rounds, source_type, config)))
 }
 
 struct AgentFailure {

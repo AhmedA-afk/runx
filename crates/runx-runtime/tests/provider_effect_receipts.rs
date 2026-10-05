@@ -10,13 +10,17 @@ use runx_contracts::{
 use runx_parser::GraphStep;
 use runx_runtime::effects::ResolvedEffectTarget;
 use runx_runtime::{
-    EffectOutputRequest, EffectPreparationOutcome, EffectStepRequest, Host, InvocationOutput,
-    LocalReceiptStore, PROVIDER_MUTATE_TOOL, PROVIDER_PERMISSION_EFFECT_FAMILY,
+    ASSISTANT_CONFIDENTIAL_TERMS_ENV, ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV, EffectOutputRequest,
+    EffectPreparationOutcome, EffectStepRequest, Host, InvocationOutput, LocalReceiptStore,
+    NOTIFICATION_AUTHORITY_ID_ENV, NOTIFICATION_SOURCE_SET_DIGEST_ENV, NotificationAuthorityGrant,
+    NotificationAuthorityGrantSpec, PROVIDER_MUTATE_TOOL, PROVIDER_PERMISSION_EFFECT_FAMILY,
     PROVIDER_PERMISSION_GRANT_ID_ENV, PROVIDER_PERMISSION_GRANTED_SCOPES_ENV,
     PROVIDER_PERMISSION_PAID_EXTERNAL_JOB_AUTHORITY_ENV, PROVIDER_PERMISSION_PRINCIPAL_REF_ENV,
     PROVIDER_READ_TOOL, ProviderApprovalEvidence, ProviderEffectAuthority, ProviderEffectClass,
     ProviderEffectIntent, ProviderEffectIntentInput, ProviderEffectResolved,
-    ProviderPermissionEffect, RuntimeEffect, RuntimeError, encode_provider_scopes_env,
+    ProviderPermissionEffect, RuntimeEffect, RuntimeEffectError, RuntimeError,
+    encode_provider_scopes_env, install_notification_authority, notification_authority_status,
+    revoke_notification_authority,
 };
 
 const PROVIDER: &str = "slack";
@@ -198,11 +202,20 @@ fn provider_effect_requested_approval_requires_a_host_attested_human() {
 }
 
 #[test]
-fn provider_effect_mutation_uses_its_grant_when_no_approval_is_requested() {
+fn unrelated_provider_mutation_uses_its_grant_when_no_approval_is_requested() {
     let mut inputs = provider_inputs(PROVIDER_MUTATE_TOOL, JsonObject::new());
     inputs.remove("approval");
-    let step = provider_step(PROVIDER_MUTATE_TOOL, "write");
-    let env = provider_env();
+    inputs.insert(
+        "operation".to_owned(),
+        JsonValue::String("thread.reply".to_owned()),
+    );
+    let mut step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    step.scopes = vec!["thread.reply".to_owned()];
+    let mut env = provider_env();
+    env.insert(
+        PROVIDER_PERMISSION_GRANTED_SCOPES_ENV.to_owned(),
+        encode_provider_scopes_env(&["thread.reply".to_owned()]).expect("scope transport"),
+    );
     let effect = ProviderPermissionEffect::default();
     let admission = effect
         .admit(effect_request(&step, &inputs, &env))
@@ -216,6 +229,257 @@ fn provider_effect_mutation_uses_its_grant_when_no_approval_is_requested() {
 
     assert!(matches!(outcome, EffectPreparationOutcome::Ready(_)));
     assert!(host.requests.is_empty());
+}
+
+#[test]
+fn assistant_provider_mutation_waits_for_an_exact_human_decision() {
+    let mut inputs = provider_inputs(PROVIDER_MUTATE_TOOL, JsonObject::new());
+    inputs.remove("approval");
+    inputs.insert(
+        "operation".to_owned(),
+        JsonValue::String("thread.reply".to_owned()),
+    );
+    let mut step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    step.scopes = vec!["thread.reply".to_owned()];
+    let mut env = provider_env();
+    env.insert(
+        PROVIDER_PERMISSION_GRANTED_SCOPES_ENV.to_owned(),
+        encode_provider_scopes_env(&["thread.reply".to_owned()]).expect("scope transport"),
+    );
+    env.insert(
+        ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV.to_owned(),
+        "required".to_owned(),
+    );
+    env.insert(ASSISTANT_CONFIDENTIAL_TERMS_ENV.to_owned(), "[]".to_owned());
+    let effect = ProviderPermissionEffect::default();
+
+    let pending = effect
+        .admit(effect_request(&step, &inputs, &env))
+        .expect("provider admission")
+        .expect("owned provider effect");
+    let mut unattended = RecordingHost::default();
+    assert!(matches!(
+        effect.prepare_execution(&step, pending, &mut unattended),
+        Ok(EffectPreparationOutcome::Pending { .. })
+    ));
+    assert_eq!(unattended.requests.len(), 1);
+
+    let forged = effect
+        .admit(effect_request(&step, &inputs, &env))
+        .expect("provider admission")
+        .expect("owned provider effect");
+    let mut agent = RecordingHost::agent_approving();
+    let refusal = effect
+        .prepare_execution(&step, forged, &mut agent)
+        .expect_err("agent-authored approval must not authorize a reply");
+    assert!(refusal.to_string().contains("host-attested human"));
+
+    let approved = effect
+        .admit(effect_request(&step, &inputs, &env))
+        .expect("provider admission")
+        .expect("owned provider effect");
+    let mut human = RecordingHost::approving();
+    assert!(matches!(
+        effect.prepare_execution(&step, approved, &mut human),
+        Ok(EffectPreparationOutcome::Ready(_))
+    ));
+    assert_eq!(human.requests.len(), 1);
+}
+
+#[test]
+fn slack_channel_post_cannot_bypass_authorization_by_omitting_approval_metadata() {
+    let mut inputs = provider_inputs(PROVIDER_MUTATE_TOOL, JsonObject::new());
+    inputs.remove("approval");
+    let step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    let env = provider_env();
+    let effect = ProviderPermissionEffect::default();
+    let admission = effect
+        .admit(effect_request(&step, &inputs, &env))
+        .expect("provider admission")
+        .expect("owned provider effect");
+    let mut host = RecordingHost::default();
+
+    let outcome = effect
+        .prepare_execution(&step, admission, &mut host)
+        .expect("notification authorization should be resumable");
+
+    assert!(matches!(outcome, EffectPreparationOutcome::Pending { .. }));
+    assert_eq!(host.requests.len(), 1);
+
+    for (provider, operation) in [(" slack ", "channel.post"), ("slack", " channel.post ")] {
+        let mut padded = inputs.clone();
+        padded.insert(
+            "expected_provider".to_owned(),
+            JsonValue::String(provider.to_owned()),
+        );
+        padded.insert(
+            "operation".to_owned(),
+            JsonValue::String(operation.to_owned()),
+        );
+        let admission = effect
+            .admit(effect_request(&step, &padded, &env))
+            .expect("padded provider admission")
+            .expect("owned provider effect");
+        let mut padded_host = RecordingHost::default();
+        assert!(matches!(
+            effect.prepare_execution(&step, admission, &mut padded_host),
+            Ok(EffectPreparationOutcome::Pending { .. })
+        ));
+        assert_eq!(padded_host.requests.len(), 1);
+    }
+
+    let mut false_provider = inputs;
+    false_provider.insert(
+        "expected_provider".to_owned(),
+        JsonValue::String("other".to_owned()),
+    );
+    assert!(
+        effect
+            .admit(effect_request(&step, &false_provider, &env))
+            .is_err()
+    );
+}
+
+#[test]
+fn standing_notification_authority_admits_only_the_pinned_private_post()
+-> Result<(), Box<dyn std::error::Error>> {
+    const SOURCE_SET: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let temp = tempfile::tempdir()?;
+    let store = temp.path().join("receipts");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    install_notification_authority(
+        &store,
+        NotificationAuthorityGrant::new(NotificationAuthorityGrantSpec {
+            authority_id: "assistant-private-update".to_owned(),
+            provider_grant_id: GRANT_ID.to_owned(),
+            principal_ref: PRINCIPAL_REF.to_owned(),
+            target: TARGET.to_owned(),
+            source_set_digest: SOURCE_SET.to_owned(),
+            expires_at_unix_seconds: now + 3600,
+            max_posts_total: 2,
+            max_posts_per_day: 2,
+            max_text_bytes: 400,
+        })?,
+    )?;
+    let mut env = provider_env();
+    env.insert(
+        runx_runtime::RUNX_RECEIPT_DIR_ENV.to_owned(),
+        store.to_string_lossy().into_owned(),
+    );
+    env.insert("RUNX_RUN_ID".to_owned(), "assistant-run-1".to_owned());
+    env.insert(
+        NOTIFICATION_AUTHORITY_ID_ENV.to_owned(),
+        "assistant-private-update".to_owned(),
+    );
+    env.insert(
+        NOTIFICATION_SOURCE_SET_DIGEST_ENV.to_owned(),
+        SOURCE_SET.to_owned(),
+    );
+    env.insert(
+        ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV.to_owned(),
+        "required".to_owned(),
+    );
+    env.insert(ASSISTANT_CONFIDENTIAL_TERMS_ENV.to_owned(), "[]".to_owned());
+    let payload = JsonObject::from([
+        (
+            "channel_locator".to_owned(),
+            JsonValue::String(TARGET.to_owned()),
+        ),
+        (
+            "text".to_owned(),
+            JsonValue::String("A bounded private update".to_owned()),
+        ),
+    ]);
+    let mut inputs = provider_inputs(PROVIDER_MUTATE_TOOL, payload);
+    inputs.remove("approval");
+    let step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    let effect = ProviderPermissionEffect::default();
+    let admission = effect
+        .admit(effect_request(&step, &inputs, &env))?
+        .ok_or("provider effect was not owned")?;
+    let mut host = RecordingHost::default();
+    assert!(matches!(
+        effect.prepare_execution(&step, admission, &mut host)?,
+        EffectPreparationOutcome::Ready(_)
+    ));
+    assert!(host.requests.is_empty());
+    assert_eq!(
+        notification_authority_status(&store, "assistant-private-update")?
+            .ok_or("missing authority")?
+            .used_posts_total,
+        1
+    );
+
+    let mut wrong_target = inputs.clone();
+    wrong_target.insert(
+        "target".to_owned(),
+        JsonValue::String("slack://T123/C999".to_owned()),
+    );
+    assert!(
+        effect
+            .admit(effect_request(&step, &wrong_target, &env))
+            .is_err()
+    );
+    let Some(JsonValue::Object(wrong_target_payload)) = wrong_target.get_mut("input") else {
+        return Err("notification payload missing".into());
+    };
+    wrong_target_payload.insert(
+        "channel_locator".to_owned(),
+        JsonValue::String("slack://T123/C999".to_owned()),
+    );
+    let admission = effect
+        .admit(effect_request(&step, &wrong_target, &env))?
+        .ok_or("provider effect was not owned")?;
+    assert!(
+        effect
+            .prepare_execution(&step, admission, &mut host)
+            .is_err()
+    );
+    let mut extra_payload = inputs.clone();
+    let Some(JsonValue::Object(extra_payload_input)) = extra_payload.get_mut("input") else {
+        return Err("notification payload missing".into());
+    };
+    extra_payload_input.insert("blocks".to_owned(), JsonValue::Array(Vec::new()));
+    assert!(
+        effect
+            .admit(effect_request(&step, &extra_payload, &env))
+            .is_err()
+    );
+    let mut mass_mention = inputs.clone();
+    let Some(JsonValue::Object(mass_mention_payload)) = mass_mention.get_mut("input") else {
+        return Err("notification payload missing".into());
+    };
+    mass_mention_payload.insert(
+        "text".to_owned(),
+        JsonValue::String("<!channel>".to_owned()),
+    );
+    let admission = effect
+        .admit(effect_request(&step, &mass_mention, &env))?
+        .ok_or("provider effect was not owned")?;
+    assert!(
+        effect
+            .prepare_execution(&step, admission, &mut host)
+            .is_err()
+    );
+    revoke_notification_authority(&store, "assistant-private-update")?;
+    let mut next_inputs = inputs;
+    next_inputs.insert(
+        "idempotency_key".to_owned(),
+        JsonValue::String("request-2".to_owned()),
+    );
+    env.insert("RUNX_RUN_ID".to_owned(), "assistant-run-2".to_owned());
+    let admission = effect
+        .admit(effect_request(&step, &next_inputs, &env))?
+        .ok_or("provider effect was not owned")?;
+    assert!(
+        effect
+            .prepare_execution(&step, admission, &mut host)
+            .is_err()
+    );
+    Ok(())
 }
 
 #[test]
@@ -283,9 +547,18 @@ fn provider_effect_approval_exposes_the_exact_plan_bound_amount() {
 
 #[test]
 fn paid_external_job_authority_executes_only_the_pinned_provider_mutation() {
-    let inputs = provider_inputs(PROVIDER_MUTATE_TOOL, JsonObject::new());
-    let step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    let mut inputs = provider_inputs(PROVIDER_MUTATE_TOOL, JsonObject::new());
+    inputs.insert(
+        "operation".to_owned(),
+        JsonValue::String("thread.reply".to_owned()),
+    );
+    let mut step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    step.scopes = vec!["thread.reply".to_owned()];
     let mut env = provider_env();
+    env.insert(
+        PROVIDER_PERMISSION_GRANTED_SCOPES_ENV.to_owned(),
+        encode_provider_scopes_env(&["thread.reply".to_owned()]).expect("scope transport"),
+    );
     env.insert(
         PROVIDER_PERMISSION_PAID_EXTERNAL_JOB_AUTHORITY_ENV.to_owned(),
         paid_external_job_authority(PRINCIPAL_REF),
@@ -306,10 +579,12 @@ fn paid_external_job_authority_executes_only_the_pinned_provider_mutation() {
     };
     assert!(host.requests.is_empty());
 
-    let resolved = resolved_effect(
+    let resolved = resolved_effect_with_operation(
         ProviderEffectClass::Mutation,
         &JsonObject::new(),
         Some("request-1"),
+        "thread.reply",
+        "thread.reply",
     );
     let claim = provider_claim(
         resolved.plan_digest(),
@@ -334,6 +609,34 @@ fn paid_external_job_authority_executes_only_the_pinned_provider_mutation() {
         reference.uri.as_str() == "runx:external-job:job-1"
             && reference.proof_kind == Some(ProofKind::EffectEvidence)
     }));
+}
+
+#[test]
+fn assistant_mutation_rejects_paid_job_authority_instead_of_skipping_human_approval() {
+    let mut inputs = provider_inputs(PROVIDER_MUTATE_TOOL, JsonObject::new());
+    inputs.insert(
+        "operation".to_owned(),
+        JsonValue::String("thread.reply".to_owned()),
+    );
+    let mut step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+    step.scopes = vec!["thread.reply".to_owned()];
+    let mut env = provider_env();
+    env.insert(
+        PROVIDER_PERMISSION_GRANTED_SCOPES_ENV.to_owned(),
+        encode_provider_scopes_env(&["thread.reply".to_owned()]).expect("scope transport"),
+    );
+    env.insert(
+        PROVIDER_PERMISSION_PAID_EXTERNAL_JOB_AUTHORITY_ENV.to_owned(),
+        paid_external_job_authority(PRINCIPAL_REF),
+    );
+    env.insert(
+        ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV.to_owned(),
+        "required".to_owned(),
+    );
+    env.insert(ASSISTANT_CONFIDENTIAL_TERMS_ENV.to_owned(), "[]".to_owned());
+    let effect = ProviderPermissionEffect::default();
+    let denied = effect.admit(effect_request(&step, &inputs, &env));
+    assert!(matches!(denied, Err(RuntimeEffectError::Denied { .. })));
 }
 
 #[test]
@@ -448,6 +751,97 @@ mod production_recovery {
     use super::*;
 
     #[test]
+    fn false_provider_identity_is_denied_before_a_slack_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transport = TimeoutThenReadbackTransport::default();
+        let effect = ProviderPermissionEffect::with_http_transport(transport.clone());
+        let mut inputs = provider_inputs(
+            PROVIDER_MUTATE_TOOL,
+            JsonObject::from([
+                (
+                    "channel_locator".to_owned(),
+                    JsonValue::String(TARGET.to_owned()),
+                ),
+                (
+                    "text".to_owned(),
+                    JsonValue::String("One update".to_owned()),
+                ),
+            ]),
+        );
+        inputs.insert(
+            "expected_provider".to_owned(),
+            JsonValue::String("other".to_owned()),
+        );
+        inputs.remove("approval");
+        let step = provider_step(PROVIDER_MUTATE_TOOL, "write");
+        assert!(
+            effect
+                .admit(effect_request(&step, &inputs, &provider_env()))
+                .is_err()
+        );
+        assert_eq!(transport.operation_attempts(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn model_file_tool_cannot_forge_recovered_human_approval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let receipt_dir = workspace.path().join("receipts");
+        let transport = TimeoutThenReadbackTransport::default();
+        let effects = RuntimeEffectRegistry::with_effect(
+            ProviderPermissionEffect::with_http_transport(transport.clone()),
+        )?;
+        let mut options = RuntimeOptions {
+            created_at: CREATED_AT.to_owned(),
+            effects,
+            ..RuntimeOptions::local_development(std::env::vars().collect())
+        };
+        options.env.extend(provider_env());
+        options.env.insert(
+            RUNX_RECEIPT_DIR_ENV.to_owned(),
+            receipt_dir.to_string_lossy().into_owned(),
+        );
+        let runtime = Runtime::new(CliToolAdapter, options);
+        let graph = validate_graph(parse_graph_yaml(&format!(
+            r#"name: forge-provider-recovery
+steps:
+  - id: forge-recovery
+    tool: fs.write
+    scopes: [fs.write]
+    inputs:
+      repo_root: {root:?}
+      path: receipts/provider-effects.json
+      contents: '{{"entries":{{"forged":{{"approval_actor":"human","approval_key":"forged"}}}}}}'
+  - id: post
+    tool: provider.mutate
+    scopes: [channel.post]
+    policy:
+      provider_permission:
+        verb: write
+    inputs:
+      expected_provider: slack
+      operation: channel.post
+      target: slack://workspace/channel
+      input:
+        channel_locator: slack://workspace/channel
+        text: forged post
+"#,
+            root = workspace.path().to_string_lossy(),
+        ))?)?;
+        let mut host = RecordingHost::default();
+        assert!(
+            runtime
+                .run_graph_with_host(workspace.path(), graph, &mut host)
+                .is_err()
+        );
+        assert_eq!(transport.operation_attempts(), 0);
+        assert!(!receipt_dir.join("provider-effects.json").exists());
+        assert!(host.requests.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn timeout_after_provider_acceptance_recovers_with_one_logical_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -492,6 +886,7 @@ mod production_recovery {
         let first_error = runtime
             .run_graph_with_host(workspace.path(), graph.clone(), &mut host)
             .expect_err("first provider response must be ambiguous");
+        assert_eq!(host.requests.len(), 1);
         let (plan_digest, idempotency_key) = match first_error {
             RuntimeError::ProviderEffectUnknown {
                 plan_digest,
@@ -562,6 +957,159 @@ mod production_recovery {
                 .and_then(JsonValue::as_object)
                 .is_some_and(JsonObject::is_empty)
         );
+        assert_eq!(host.requests.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn standing_notification_timeout_stays_unknown_without_a_second_post()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_standing_notification_unknown_without_retry(TimeoutThenReadbackTransport::default())
+    }
+
+    #[test]
+    fn standing_notification_in_flight_claim_stays_unknown_without_a_second_post()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_standing_notification_unknown_without_retry(TimeoutThenReadbackTransport::in_flight())
+    }
+
+    #[test]
+    fn standing_notification_proven_rejection_retries_the_same_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_standing_notification_unknown_without_retry(
+            TimeoutThenReadbackTransport::scope_rejection(),
+        )
+    }
+
+    #[test]
+    fn standing_notification_binding_rejection_retries_the_same_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_standing_notification_unknown_without_retry(
+            TimeoutThenReadbackTransport::binding_rejection(),
+        )
+    }
+
+    fn assert_standing_notification_unknown_without_retry(
+        transport: TimeoutThenReadbackTransport,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const SOURCE_SET: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let workspace = tempfile::tempdir()?;
+        let receipt_dir = workspace.path().join("receipts");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        install_notification_authority(
+            &receipt_dir,
+            NotificationAuthorityGrant::new(NotificationAuthorityGrantSpec {
+                authority_id: "assistant-private-update".to_owned(),
+                provider_grant_id: GRANT_ID.to_owned(),
+                principal_ref: PRINCIPAL_REF.to_owned(),
+                target: "slack://workspace/channel".to_owned(),
+                source_set_digest: SOURCE_SET.to_owned(),
+                expires_at_unix_seconds: now + 3600,
+                max_posts_total: 1,
+                max_posts_per_day: 1,
+                max_text_bytes: 400,
+            })?,
+        )?;
+        let effects = RuntimeEffectRegistry::with_effect(
+            ProviderPermissionEffect::with_http_transport(transport.clone()),
+        )?;
+        let mut options = RuntimeOptions {
+            created_at: CREATED_AT.to_owned(),
+            effects,
+            ..RuntimeOptions::local_development(std::env::vars().collect())
+        };
+        options.env.extend(provider_env());
+        options.env.insert(
+            HOSTED_API_BASE_URL_ENV.to_owned(),
+            "https://api.runx.recovery".to_owned(),
+        );
+        options
+            .env
+            .insert(HOSTED_API_TOKEN_ENV.to_owned(), "rxk_recovery".to_owned());
+        options.env.insert(
+            RUNX_RECEIPT_DIR_ENV.to_owned(),
+            receipt_dir.to_string_lossy().into_owned(),
+        );
+        options
+            .env
+            .insert(RUNX_RUN_ID_ENV.to_owned(), "assistant-run-1".to_owned());
+        options.env.insert(
+            NOTIFICATION_AUTHORITY_ID_ENV.to_owned(),
+            "assistant-private-update".to_owned(),
+        );
+        options.env.insert(
+            NOTIFICATION_SOURCE_SET_DIGEST_ENV.to_owned(),
+            SOURCE_SET.to_owned(),
+        );
+        options.env.insert(
+            "RUNX_HOME".to_owned(),
+            workspace.path().join("home").to_string_lossy().into_owned(),
+        );
+        let runtime = Runtime::new(CliToolAdapter, options);
+        let graph = validate_graph(parse_graph_yaml(STANDING_NOTIFICATION_GRAPH)?)?;
+        let mut host = RecordingHost::default();
+        if transport.state.scope_rejection || transport.state.binding_rejection {
+            let code = if transport.state.binding_rejection {
+                "binding_unavailable"
+            } else {
+                "scope_mismatch"
+            };
+            match runtime.run_graph_with_host(workspace.path(), graph.clone(), &mut host) {
+                Err(RuntimeError::SkillFailed { ref message, .. }) if message.contains(code) => {}
+                other => return Err(format!("expected {code} rejection, got {other:?}").into()),
+            }
+            runtime.run_graph_with_host(workspace.path(), graph, &mut host)?;
+            assert_eq!(transport.operation_attempts(), 2);
+            assert_eq!(transport.logical_mutations(), 1);
+            assert_eq!(transport.idempotency_keys().len(), 2);
+            assert_eq!(
+                transport.idempotency_keys()[0],
+                transport.idempotency_keys()[1]
+            );
+            assert_eq!(
+                notification_authority_status(&receipt_dir, "assistant-private-update")?
+                    .ok_or("missing notification authority")?
+                    .used_posts_total,
+                1
+            );
+            assert!(host.requests.is_empty());
+            return Ok(());
+        }
+        let first_identity =
+            match runtime.run_graph_with_host(workspace.path(), graph.clone(), &mut host) {
+                Err(RuntimeError::ProviderEffectUnknown {
+                    plan_digest,
+                    idempotency_key,
+                    ..
+                }) => (plan_digest, idempotency_key),
+                other => {
+                    return Err(format!("expected unknown first outcome, got {other:?}").into());
+                }
+            };
+        let second_identity = match runtime.run_graph_with_host(workspace.path(), graph, &mut host)
+        {
+            Err(RuntimeError::ProviderEffectUnknown {
+                plan_digest,
+                idempotency_key,
+                ..
+            }) => (plan_digest, idempotency_key),
+            other => return Err(format!("expected held unknown outcome, got {other:?}").into()),
+        };
+        assert_eq!(first_identity, second_identity);
+        let pending: JsonValue =
+            serde_json::from_slice(&std::fs::read(receipt_dir.join("provider-effects.json"))?)?;
+        assert!(serde_json::to_string(&pending)?.contains(&first_identity.1));
+        assert_eq!(transport.operation_attempts(), 1);
+        assert_eq!(transport.logical_mutations(), 1);
+        assert_eq!(
+            notification_authority_status(&receipt_dir, "assistant-private-update")?
+                .ok_or("missing notification authority")?
+                .used_posts_total,
+            1
+        );
         assert!(host.requests.is_empty());
         Ok(())
     }
@@ -577,9 +1125,39 @@ mod production_recovery {
         logical_mutations: AtomicU64,
         idempotency_keys: Mutex<Vec<String>>,
         accepted: Mutex<BTreeMap<String, JsonObject>>,
+        in_flight: bool,
+        scope_rejection: bool,
+        binding_rejection: bool,
     }
 
     impl TimeoutThenReadbackTransport {
+        fn in_flight() -> Self {
+            Self {
+                state: Arc::new(TimeoutThenReadbackState {
+                    in_flight: true,
+                    ..TimeoutThenReadbackState::default()
+                }),
+            }
+        }
+
+        fn scope_rejection() -> Self {
+            Self {
+                state: Arc::new(TimeoutThenReadbackState {
+                    scope_rejection: true,
+                    ..TimeoutThenReadbackState::default()
+                }),
+            }
+        }
+
+        fn binding_rejection() -> Self {
+            Self {
+                state: Arc::new(TimeoutThenReadbackState {
+                    binding_rejection: true,
+                    ..TimeoutThenReadbackState::default()
+                }),
+            }
+        }
+
         fn operation_attempts(&self) -> u64 {
             self.state.operation_attempts.load(Ordering::Relaxed)
         }
@@ -638,6 +1216,18 @@ mod production_recovery {
                 .operation_attempts
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
+            if self.state.scope_rejection && attempt == 1 {
+                return Ok(RuntimeHttpResponse::new(
+                    400,
+                    r#"{"error":"provider scope does not allow channel.post","code":"scope_mismatch"}"#,
+                ));
+            }
+            if self.state.binding_rejection && attempt == 1 {
+                return Ok(RuntimeHttpResponse::new(
+                    403,
+                    r#"{"error":"provider binding is unavailable","code":"binding_unavailable"}"#,
+                ));
+            }
             let mut accepted = self
                 .state
                 .accepted
@@ -662,6 +1252,12 @@ mod production_recovery {
                 })
                 .clone();
             if attempt == 1 {
+                if self.state.in_flight {
+                    return Ok(RuntimeHttpResponse::new(
+                        409,
+                        r#"{"error":"mutation already in flight","code":"idempotency_in_flight"}"#,
+                    ));
+                }
                 return Err(transport_error(
                     "request deadline exceeded after provider acceptance",
                 ));
@@ -718,6 +1314,27 @@ steps:
       idempotency_key: request-1
       result_fields: [message_locator]
       input:
+        text: hello from recovery
+"#;
+
+    const STANDING_NOTIFICATION_GRAPH: &str = r#"
+name: standing-notification-recovery
+steps:
+  - id: provider-operation
+    tool: provider.mutate
+    scopes: [channel.post]
+    idempotency_key: request-1
+    policy:
+      provider_permission:
+        verb: write
+    inputs:
+      expected_provider: slack
+      operation: channel.post
+      target: slack://workspace/channel
+      idempotency_key: request-1
+      result_fields: [message_locator]
+      input:
+        channel_locator: slack://workspace/channel
         text: hello from recovery
 "#;
 }
@@ -904,14 +1521,24 @@ fn resolved_effect(
     payload: &JsonObject,
     request_key: Option<&str>,
 ) -> ProviderEffectResolved {
+    resolved_effect_with_operation(class, payload, request_key, OPERATION, SCOPE)
+}
+
+fn resolved_effect_with_operation(
+    class: ProviderEffectClass,
+    payload: &JsonObject,
+    request_key: Option<&str>,
+    operation: &str,
+    scope: &str,
+) -> ProviderEffectResolved {
     ProviderEffectResolved::new(
         ProviderEffectIntent::new(ProviderEffectIntentInput {
             class,
             provider: PROVIDER,
-            operation: OPERATION,
+            operation,
             target: TARGET,
             payload,
-            required_scopes: vec![SCOPE.to_owned()],
+            required_scopes: vec![scope.to_owned()],
             amount: None,
             approval_digest: (class == ProviderEffectClass::Mutation)
                 .then(provider_approval_request_digest),

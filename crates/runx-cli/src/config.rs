@@ -7,9 +7,9 @@ use std::path::Path;
 
 use crate::cli_args::{os_arg, split_flag};
 use runx_runtime::{
-    ConfigError, RunxConfigFile, load_runx_config_file, lookup_runx_config_value,
-    mask_runx_config_file, parse_config_key, resolve_runx_home_dir, update_runx_config_value,
-    write_runx_config_file,
+    ConfigError, RunxConfigFile, clear_runx_agent_endpoint_url, load_runx_config_file,
+    lookup_runx_config_value, mask_runx_config_file, parse_config_key, resolve_runx_home_dir,
+    update_runx_config_value, write_runx_config_file,
 };
 use serde::Serialize;
 
@@ -19,6 +19,7 @@ pub enum ConfigAction {
     Set,
     Get,
     List,
+    Unset,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +47,11 @@ pub enum ConfigResult {
     List {
         action: ConfigAction,
         values: Box<RunxConfigFile>,
+    },
+    Unset {
+        action: ConfigAction,
+        key: String,
+        value: Option<String>,
     },
 }
 
@@ -80,7 +86,7 @@ impl From<serde_json::Error> for ConfigCliError {
     }
 }
 
-// Function rationale: config set/get/list share one small
+// Function rationale: config set/get/list/unset share one small
 // flag grammar and keeping it adjacent avoids divergent command parsing.
 pub fn parse_config_plan(args: &[OsString]) -> Result<ConfigPlan, String> {
     let command = os_arg(args, 0, "config")?;
@@ -89,12 +95,13 @@ pub fn parse_config_plan(args: &[OsString]) -> Result<ConfigPlan, String> {
     }
 
     let Some(subcommand) = args.get(1).and_then(|arg| arg.to_str()) else {
-        return Err("runx config requires set, get, or list".to_owned());
+        return Err("runx config requires set, get, list, or unset".to_owned());
     };
     let action = match subcommand {
         "set" => ConfigAction::Set,
         "get" => ConfigAction::Get,
         "list" => ConfigAction::List,
+        "unset" => ConfigAction::Unset,
         _ => return Err(format!("unknown config subcommand {subcommand}")),
     };
 
@@ -161,6 +168,25 @@ pub fn parse_config_plan(args: &[OsString]) -> Result<ConfigPlan, String> {
                 json,
             })
         }
+        ConfigAction::Unset => {
+            if value_from_stdin {
+                return Err("runx config unset does not accept --from-stdin".to_owned());
+            }
+            let [key] = positionals.as_slice() else {
+                return Err("runx config unset requires exactly one key".to_owned());
+            };
+            let key = normalize_config_key(key);
+            if key != "agent.endpoint_url" {
+                return Err("runx config unset supports only agent.endpoint_url".to_owned());
+            }
+            Ok(ConfigPlan {
+                action,
+                key: Some(key.to_owned()),
+                value: None,
+                value_from_stdin: false,
+                json,
+            })
+        }
         ConfigAction::Set => {
             let [key, values @ ..] = positionals.as_slice() else {
                 return Err("runx config set requires a key".to_owned());
@@ -202,6 +228,8 @@ fn normalize_config_key(key: &str) -> &str {
     match key {
         "provider" => "agent.provider",
         "model" => "agent.model",
+        "endpoint-url" => "agent.endpoint_url",
+        "auth-mode" => "agent.auth_mode",
         "api-key" | "agent-key" => "agent.api_key",
         "public-token" => "public.api_token",
         _ => key,
@@ -263,6 +291,21 @@ fn execute_config_plan(
                 value: lookup_runx_config_value(&mask_runx_config_file(&next), parsed_key),
             })
         }
+        ConfigAction::Unset => {
+            let key = required_key(plan)?;
+            if key != "agent.endpoint_url" {
+                return Err(ConfigCliError::InvalidArgs(
+                    "runx config unset supports only agent.endpoint_url".to_owned(),
+                ));
+            }
+            let next = clear_runx_agent_endpoint_url(config);
+            write_runx_config_file(&config_path, &next)?;
+            Ok(ConfigResult::Unset {
+                action: ConfigAction::Unset,
+                key: key.to_owned(),
+                value: None,
+            })
+        }
     }
 }
 
@@ -285,7 +328,9 @@ fn render_config_result(result: &ConfigResult) -> String {
                 .collect::<Vec<_>>();
             render_key_value("config", "success", &rows)
         }
-        ConfigResult::Get { key, value, .. } | ConfigResult::Set { key, value, .. } => {
+        ConfigResult::Get { key, value, .. }
+        | ConfigResult::Set { key, value, .. }
+        | ConfigResult::Unset { key, value, .. } => {
             render_key_value("config", "success", &[(key.as_str(), value.as_deref())])
         }
     }
@@ -299,6 +344,12 @@ fn flatten_config(config: &RunxConfigFile) -> Vec<(&'static str, &str)> {
         }
         if let Some(model) = agent.model.as_deref() {
             rows.push(("agent.model", model));
+        }
+        if let Some(endpoint_url) = agent.endpoint_url.as_deref() {
+            rows.push(("agent.endpoint_url", endpoint_url));
+        }
+        if let Some(auth_mode) = agent.auth_mode.as_deref() {
+            rows.push(("agent.auth_mode", auth_mode));
         }
         if let Some(api_key_ref) = agent.api_key_ref.as_deref() {
             rows.push(("agent.api_key", api_key_ref));
@@ -346,6 +397,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -368,6 +420,21 @@ mod tests {
                 json: true,
             })
         );
+    }
+
+    #[test]
+    fn unset_is_limited_to_the_reversible_endpoint_setting() {
+        assert_eq!(
+            parse_config_plan(&["config".into(), "unset".into(), "endpoint-url".into()]),
+            Ok(ConfigPlan {
+                action: ConfigAction::Unset,
+                key: Some("agent.endpoint_url".to_owned()),
+                value: None,
+                value_from_stdin: false,
+                json: false,
+            })
+        );
+        assert!(parse_config_plan(&["config".into(), "unset".into(), "api-key".into()]).is_err());
     }
 
     #[test]
@@ -481,6 +548,105 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn local_model_settings_round_trip_and_invalid_mode_remains_repairable()
+    -> Result<(), ConfigTestError> {
+        let temp = tempfile_dir()?;
+        let runx_home = temp.join(".runx");
+        let env = BTreeMap::from([(
+            "RUNX_HOME".to_owned(),
+            runx_home.to_string_lossy().into_owned(),
+        )]);
+        for (key, value) in [
+            ("agent.provider", "openai"),
+            ("agent.model", "fixture-model"),
+            ("agent.auth_mode", "local_none"),
+            (
+                "agent.endpoint_url",
+                "http://127.0.0.1:18081/v1/chat/completions",
+            ),
+        ] {
+            run_config_command(
+                &ConfigPlan {
+                    action: ConfigAction::Set,
+                    key: Some(key.to_owned()),
+                    value: Some(value.to_owned()),
+                    value_from_stdin: false,
+                    json: false,
+                },
+                &env,
+                &temp,
+            )?;
+        }
+        let list = run_config_command(
+            &ConfigPlan {
+                action: ConfigAction::List,
+                key: None,
+                value: None,
+                value_from_stdin: false,
+                json: true,
+            },
+            &env,
+            &temp,
+        )?;
+        let listed: serde_json::Value =
+            serde_json::from_str(&list).map_err(|error| io::Error::other(error.to_string()))?;
+        assert_eq!(
+            listed["config"]["values"]["agent"]["auth_mode"],
+            "local_none"
+        );
+        assert_eq!(
+            listed["config"]["values"]["agent"]["endpoint_url"],
+            "http://127.0.0.1:18081/v1/chat/completions"
+        );
+
+        let path = runx_home.join("config.json");
+        let mut raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        raw["agent"]["auth_mode"] = serde_json::Value::String("bad_mode".to_owned());
+        fs::write(
+            &path,
+            serde_json::to_vec(&raw).map_err(|error| io::Error::other(error.to_string()))?,
+        )?;
+        let get = run_config_command(
+            &ConfigPlan {
+                action: ConfigAction::Get,
+                key: Some("agent.auth_mode".to_owned()),
+                value: None,
+                value_from_stdin: false,
+                json: false,
+            },
+            &env,
+            &temp,
+        )?;
+        assert!(get.contains("bad_mode"));
+        let bad_set = run_config_command(
+            &ConfigPlan {
+                action: ConfigAction::Set,
+                key: Some("agent.auth_mode".to_owned()),
+                value: Some("bad_mode".to_owned()),
+                value_from_stdin: false,
+                json: false,
+            },
+            &env,
+            &temp,
+        );
+        assert!(bad_set.is_err());
+        run_config_command(
+            &ConfigPlan {
+                action: ConfigAction::Set,
+                key: Some("agent.auth_mode".to_owned()),
+                value: Some("local_none".to_owned()),
+                value_from_stdin: false,
+                json: false,
+            },
+            &env,
+            &temp,
+        )?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
     #[derive(Debug)]
     enum ConfigTestError {
         Io(io::Error),
@@ -511,15 +677,17 @@ mod tests {
     }
 
     fn tempfile_dir() -> Result<PathBuf, io::Error> {
+        static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "runx-cli-config-{}-{}",
+            "runx-cli-config-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path)?;
+        fs::create_dir(&path)?;
         Ok(path)
     }
 }
