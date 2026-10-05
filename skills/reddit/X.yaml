@@ -119,7 +119,7 @@ runners:
                 properties:
                   status:
                     type: string
-                    enum: [drafted, analyzed, needs_browser, held, needs_input]
+                    enum: [drafted, provisional, analyzed, needs_browser, held, needs_input]
                   account_id: {type: string, minLength: 3, maxLength: 20, pattern: '^[a-z0-9_-]{3,20}$'}
                   observations:
                     type: array
@@ -225,7 +225,7 @@ runners:
                 properties:
                   status:
                     type: string
-                    enum: [drafted, analyzed, needs_browser, held, needs_input]
+                    enum: [drafted, provisional, analyzed, needs_browser, held, needs_input]
                   account_id: {type: string, minLength: 3, maxLength: 20, pattern: '^[a-z0-9_-]{3,20}$'}
                   observations:
                     type: array

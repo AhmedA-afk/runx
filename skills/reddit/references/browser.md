@@ -31,7 +31,8 @@ background, scoped input action and exposes a readable result. Use that
 supported editor path. Do not assume setting `innerHTML`, dispatching synthetic
 input events, or assigning a `value` submitted anything. A rich-text editor may
 reject those changes. If the connector cannot enter text and read it back
-reliably, research returns `needs_browser`. A submit or vote continuation that
+reliably, public research can still return a provisional draft. The submit
+continuation stops before any effect unless a supported input path is available. A submit or vote continuation that
 stopped before any effect returns `not_submitted`, `affirmative_no_submit: true`
 and `effect_attempted: false`; uncertainty returns `uncertain`. Do not improvise
 foreground Swift/keyboard input, clipboard changes, or raw API fetches. Never click a guessed coordinate.
@@ -88,7 +89,10 @@ reply. Record the command's
 `observed_at` and compare a later snapshot before claiming momentum. Navigate
 only to exact Reddit pages needed for this session. The tool refuses to
 touch the tab when it is the user's foreground tab, including during identity
-checks. It never activates a
+checks. If that happens during research, continue from public pages. A separate
+background tab may be rebound only after its Reddit username and intended
+profile context are verified; do not move the foreground tab or ask the
+operator to switch windows merely to research. It never activates a
 window, changes the active tab, uses a clipboard or sends global keystrokes.
 
 After an approved host submission, if a comment permalink is available,

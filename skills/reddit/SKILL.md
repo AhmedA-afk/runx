@@ -96,7 +96,7 @@ bridge is acceptable when it can address a particular Brave window/tab and
 perform the required DOM operation without taking focus. Swift accessibility
 or screen-coordinate typing that needs foreground focus is not a background
 connector. If the editor requires focus and the host cannot satisfy this
-contract, research returns `needs_browser`. A publish or vote continuation returns
+contract, public research may still return provisional drafts; live submission stops before the effect. A publish or vote continuation returns
 `not_submitted`, `affirmative_no_submit: true`, and `effect_attempted: false`
 only if it stopped before attempting any effect; otherwise return `uncertain`.
 Ask for a narrowly scoped foreground exception or leave the text for manual submission.
@@ -145,12 +145,17 @@ posts, normally three to five per community. Record their observed ages,
 scores and reply counts where visible, plus whether the replies are substantive.
 Check for a recent duplicate and say what specific question the proposed post
 adds. A large community with generic or fast-moving posts can be a worse fit
-than a smaller one with active discussion of this exact problem. Do not use a
-community whose rules or account eligibility remain unknown as the selected
-posting target.
+than a smaller one with active discussion of this exact problem. A community with unknown rules cannot be a selected target. Unknown account
+eligibility may support a provisional research draft, but must be checked in
+the logged-in session before publication.
 
 For comments, scan a bounded set of relevant threads, normally five to ten
-across a few communities when no thread was supplied. Timely mode starts with
+across a few communities when no thread was supplied. If the proposed action
+is a reply to another comment, measure that exact branch as well as the post:
+parent-comment score, age, reply count, sort position and whether fresh replies
+are arriving. A viral post does not give a two-vote comment the same reach.
+A quiet direct answer may be useful in solution-request mode, but do not label
+it a high-reach karma opportunity merely because the enclosing post is large. Timely mode starts with
 fresh discussions; active-request mode starts with recent specific asks;
 evergreen mode starts with the search queries the intended reader would use
 and follows the threads those searches actually surface. Read the actual post
@@ -174,13 +179,18 @@ Scan a bounded set of fresh threads on subjects the account can speak to.
 Rank a candidate only after reading its leading replies. First require a
 specific new fact, answer, or timely connection that those replies lack. Then
 compare age, visible votes, reply count, and whether new replies are still
-arriving. Prefer an early live discussion with a clear point over an older
+arriving for both the post and the exact reply branch. Record both levels
+separately in activity samples and candidate risk; do not borrow post-level
+votes to score a low-visibility branch. Prefer an early live discussion with a clear point over an older
 viral thread whose top replies have settled the conversation. A second
 snapshot can show observed activity; one snapshot cannot establish growth.
 Look for another current story only when a verified callback is immediately
 clear to the thread's readers. Reject a factual summary that merely repeats
 the linked article, a copied leading point, and a joke that needs explaining.
-The draft should make its point in one read and stop.
+The draft should make its point in one read and stop. Before ranking
+it for growth, name the natural next response it might invite from this
+thread. If the only likely replies are thanks or agreement, call it a useful
+answer, not a conversation seed. Do not tack on a question to manufacture one.
 
 ### Solution request opportunities
 
@@ -238,8 +248,11 @@ Return `target_candidates` for the targets inspected. Mark each selected,
 alternate or rejected; include source URLs and observation times, community
 rule and account-eligibility status, bounded activity samples, the contribution
 gap, reason and risk. Match each draft to a selected candidate's exact target. The default graph
-checks that every draft has a selected candidate with allowed rules and eligible
-account status; an unsupported draft returns `held` with no drafts before it can be handed to `publish`.
+checks that every draft has a selected candidate with allowed rules. A selected
+candidate with unknown account eligibility yields `provisional`, retaining the
+draft for review and stating the missing check. Disallowed rules or known
+ineligibility return `held` with no drafts. `provisional` is never proof that
+the account can submit; `publish` requires fresh logged-in checks.
 Keep observed metrics separate from a judgment about likely discussion or
 future discovery. For evergreen candidates, put the exact search queries and
 observed result URLs in `observations` and `source_urls`, with the retrieval
@@ -391,8 +404,10 @@ machinery is not a browser transport. General writing may use
 For `reddit-research`, do only the requested discovery/read/draft/diagnosis
 work. Never submit. Load the account voice and browser instructions. Report what was
 actually observed, compare post communities and comment threads when target
-discovery is requested, include sources outside draft text, and return `needs_browser`
-or `held` when the browser/identity/eligibility is unavailable.
+discovery is requested, include sources outside draft text, and return a `provisional` draft when
+public evidence is enough but browser identity or eligibility is unavailable.
+Return `needs_browser` only when required evidence cannot be obtained without
+the browser, and `held` for disallowed rules or known ineligibility.
 
 For `reddit-submit`, proceed only from this run's native approval and durable
 reservation. Perform at most one submit. Return the matched account, target,

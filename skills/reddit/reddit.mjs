@@ -108,13 +108,16 @@ export function loadAccount(inputs) {
 export function validateResearch(inputs) {
   const research = inputs.research;
   let reason = '';
+  let provisional = false;
   try {
     ensure(research.account_id === inputs.account.account_id, 'Research account differs from the loaded account.');
     const selected = research.target_candidates.filter(candidate => candidate.decision === 'selected');
     for (const candidate of selected) {
       const target = redditUrl(candidate.target_url);
       ensure(target.community === candidate.subreddit.toLowerCase(), 'Selected target community mismatch.');
-      ensure(candidate.rule_status === 'allowed' && candidate.account_eligibility === 'eligible', 'Selected target needs confirmed rules and account eligibility.');
+      ensure(candidate.rule_status === 'allowed', 'Selected target needs confirmed community rules.');
+      ensure(candidate.account_eligibility !== 'ineligible', 'Selected target account is ineligible.');
+      if (candidate.account_eligibility === 'unknown') provisional = true;
       if (candidate.intent === 'post') ensure(target.parts.length === 3 && target.parts[2] === 'submit', 'Selected post target must be its subreddit submit page.');
       else ensure(target.parts[2] === 'comments' && /^[a-z0-9]+$/u.test(target.parts[3] || ''), 'Selected comment target must be a specific thread.');
     }
@@ -125,9 +128,14 @@ export function validateResearch(inputs) {
       ensure(selected.some(candidate => candidate.intent === intent && candidate.target_url === action.target_url), 'Draft has no selected, eligible target candidate.');
     }
   } catch (error) { reason = error.message; }
+  const needsEligibility = !reason && provisional && research.drafts.length > 0;
   return {
-    research: reason ? { ...research, account_id: inputs.account.account_id, status: 'held', drafts: [], unknowns: [...research.unknowns.slice(0, 11), reason], next_step: 'Re-evaluate the target evidence before drafting or publishing.' } : research,
-    target_review: { admitted: reason === '', reason, candidate_count: research.target_candidates.length, draft_count: reason ? 0 : research.drafts.length }
+    research: reason
+      ? { ...research, account_id: inputs.account.account_id, status: 'held', drafts: [], unknowns: [...research.unknowns.slice(0, 11), reason], next_step: 'Re-evaluate the target evidence before drafting or publishing.' }
+      : needsEligibility
+        ? { ...research, status: 'provisional', unknowns: [...research.unknowns.slice(0, 11), 'Account eligibility is unverified.'], next_step: 'Review the draft; verify the logged-in account, community eligibility, thread, and editor immediately before any approved submission.' }
+        : research,
+    target_review: { admitted: reason === '', reason: needsEligibility ? 'Draft admitted provisionally; account eligibility requires an authenticated recheck.' : reason, candidate_count: research.target_candidates.length, draft_count: reason ? 0 : research.drafts.length }
   };
 }
 export function identify(inputs) {

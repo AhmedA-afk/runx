@@ -73,3 +73,13 @@ engagement as hypotheses unless stronger evidence exists.
 USPS discussion: https://www.reddit.com/r/technology/comments/1wugs04/usps_to_put_cameras_in_trucks_that_scan_roads_for/
 Court discussion: https://www.reddit.com/r/technology/comments/1wuhnax/ai_training_of_copyrighted_material_not_fair_use/
 RSS discussion: https://www.reddit.com/r/technology/comments/1wubsf7/reddit_is_killing_rss_feeds_and_ending_public_api/
+
+## Reach and conversation context
+
+A comment plants a useful detail in a live conversation. Check the exact reply
+position before calling it a growth opportunity: the parent comment’s age,
+score, replies, sort position, and recent activity matter separately from the
+post’s totals. A factual answer to a two-vote question inside a viral post may
+help that person, but it is not evidence of broad reach. State which job the
+comment serves. A natural follow-up is a sign of conversational room; do not
+append a generic question or clever closer to force one.

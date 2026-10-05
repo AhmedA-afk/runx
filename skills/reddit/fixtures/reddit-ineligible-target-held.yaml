@@ -1,4 +1,4 @@
-name: reddit-unknown-target-eligibility
+name: reddit-ineligible-target-held
 kind: graph
 target: support/discovery.graph
 caller:
@@ -18,7 +18,7 @@ caller:
           target_url: 'https://www.reddit.com/r/learnprogramming/submit'
           observed_at: '2026-09-30T03:00:00Z'
           rule_status: allowed
-          account_eligibility: unknown
+          account_eligibility: ineligible
           activity_samples:
           - {source_url: 'https://www.reddit.com/r/learnprogramming/comments/abc123/example/', observed_at: '2026-09-30T03:00:00Z', age_label: '2 hours', score_label: '8', reply_count_label: '6'}
           contribution_gap: A concrete question about finding where a request failed is not duplicated in the synthetic sample.
@@ -65,6 +65,6 @@ expect:
   step_outputs:
     research:
       subset:
-        research: {status: provisional}
-        target_review: {admitted: true, draft_count: 2}
-env: {RUNX_DATA_SOURCES: '{"data_sources": {"local://reddit": {"adapter": "data.sqlite", "database_path": ".runx/reddit-fixtures/reddit-unknown-target-eligibility.sqlite", "resources": {"reddit_accounts": {"kind": "event_stream", "partition_key": "aggregate_id"}, "reddit_browser": {"kind": "event_stream", "partition_key": "aggregate_id"}, "reddit_attempts": {"kind": "event_stream", "partition_key": "aggregate_id"}}}}}'}
+        research: {status: held, drafts: []}
+        target_review: {admitted: false}
+env: {RUNX_DATA_SOURCES: '{"data_sources": {"local://reddit": {"adapter": "data.sqlite", "database_path": ".runx/reddit-fixtures/reddit-ineligible-target-held.sqlite", "resources": {"reddit_accounts": {"kind": "event_stream", "partition_key": "aggregate_id"}, "reddit_browser": {"kind": "event_stream", "partition_key": "aggregate_id"}, "reddit_attempts": {"kind": "event_stream", "partition_key": "aggregate_id"}}}}}'}
