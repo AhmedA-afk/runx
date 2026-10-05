@@ -82,6 +82,17 @@ fn query(
 fn execute(
     invocation: &NativeInvocation<'_, HttpBatchInput>,
 ) -> Result<HttpBatchOutput, RuntimeError> {
+    // The local assistant's mandatory approval and confidential-egress policy
+    // is enforced by the provider effect owner. A raw HTTP mutation cannot
+    // produce that effect's approval, attempt, or recovery evidence.
+    if invocation
+        .env
+        .contains_key(crate::effects::ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV)
+    {
+        return Err(invalid(
+            "assistant HTTP mutations require provider.mutate so approval and recovery own the effect",
+        ));
+    }
     decode_typed_output(
         "http.execute",
         execute_batch(invocation, BatchMode::Execute)?,
@@ -98,6 +109,37 @@ fn invalid(message: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "catalog")]
+    #[test]
+    fn assistant_http_mutation_cannot_bypass_provider_effect() {
+        let inputs = HttpBatchInput {
+            requests: Vec::new(),
+            allowed_hosts: Vec::new(),
+            auth: None,
+            stop_on_error: true,
+        };
+        let env = BTreeMap::from([(
+            crate::effects::ASSISTANT_REQUIRE_MUTATION_APPROVAL_ENV.to_owned(),
+            "required".to_owned(),
+        )]);
+        let credentials = crate::CredentialDelivery::none();
+        let effects = crate::RuntimeEffectRegistry::default();
+        let invocation = NativeInvocation {
+            inputs: &inputs,
+            observed_at: "2026-01-01T00:00:00Z",
+            data_source_binding: None,
+            env: &env,
+            skill_directory: std::path::Path::new("."),
+            credential_delivery: &credentials,
+            local_artifacts: crate::tool_catalogs::native::fixture_local_artifacts(),
+            effects: &effects,
+        };
+        assert!(execute(&invocation)
+            .expect_err("assistant mutation must stop before HTTP admission")
+            .to_string()
+            .contains("require provider.mutate"));
+    }
 
     #[test]
     fn oauth_percent_encoding_matches_rfc_5849() {
