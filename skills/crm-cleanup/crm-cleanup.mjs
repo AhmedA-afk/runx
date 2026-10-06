@@ -95,3 +95,49 @@ function uniqueStrings(value) {
 function record(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
+
+export function applyUpdates(inputs) {
+  const proposal = record(inputs.crm_update_proposal);
+  const records = (Array.isArray(inputs.crm_records) ? inputs.crm_records : []).map(record);
+  const recordsById = new Map(records.map((entry) => [stringValue(entry.id), entry]));
+  const applied = [];
+  const writeLog = [];
+
+  if (proposal.decision !== "proposed" || !Array.isArray(proposal.updates)) {
+    return {
+      crm_write_result: {
+        schema: "runx.crm_write_result.v1",
+        executed: false,
+        reason: "No proposed updates to apply; nothing was written.",
+        write_result: { before: [], after: [] },
+      },
+    };
+  }
+
+  for (const update of proposal.updates) {
+    const recordId = stringValue(update.record_id);
+    const field = stringValue(update.field);
+    const target = recordsById.get(recordId);
+    if (!target || !field) continue;
+    const before = target[field] === undefined ? null : target[field];
+    const after = update.to;
+    target[field] = after;
+    applied.push({ record_id: recordId, field, before, after });
+    writeLog.push(`mock-transport: ${recordId}.${field} ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+  }
+
+  return {
+    crm_write_result: {
+      schema: "runx.crm_write_result.v1",
+      executed: applied.length > 0,
+      reason: applied.length > 0
+        ? `Applied ${applied.length} update(s) through the mock CRM transport.`
+        : "No updates were applicable; nothing was written.",
+      write_result: {
+        before: applied.map((a) => ({ record_id: a.record_id, field: a.field, value: a.before })),
+        after: applied.map((a) => ({ record_id: a.record_id, field: a.field, value: a.after })),
+      },
+      transport_log: writeLog,
+    },
+  };
+}

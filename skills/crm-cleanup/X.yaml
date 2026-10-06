@@ -1,5 +1,5 @@
 skill: crm-cleanup
-version: "0.2.0"
+version: "0.3.0"
 
 catalog:
   kind: graph
@@ -309,6 +309,67 @@ harness:
                   validation: { status: pass, findings: [] }
         receipt: { schema: runx.receipt.v1 }
 
+    - name: crm-cleanup-apply-sealed-write
+      runner: apply
+      inputs:
+        crm_update_proposal:
+          schema: runx.crm_update_proposal.v1
+          decision: proposed
+          updates:
+            - record_id: acct-globex
+              field: account_status
+              from: healthy
+              to: at_risk
+              evidence_quote: the rollout stalled
+        crm_records:
+          - id: acct-globex
+            account_status: healthy
+      expect:
+        status: sealed
+        steps: [transport]
+        step_outputs:
+          transport:
+            subset:
+              crm_write_result:
+                data:
+                  schema: runx.crm_write_result.v1
+                  executed: true
+                  write_result:
+                    before:
+                      - record_id: acct-globex
+                        field: account_status
+                        value: healthy
+                    after:
+                      - record_id: acct-globex
+                        field: account_status
+                        value: at_risk
+        receipt: { schema: runx.receipt.v1 }
+
+    - name: crm-cleanup-apply-noop-executes-nothing
+      runner: apply
+      inputs:
+        crm_update_proposal:
+          schema: runx.crm_update_proposal.v1
+          decision: no_action
+          updates: []
+        crm_records:
+          - id: acct-globex
+            account_status: healthy
+      expect:
+        status: sealed
+        steps: [transport]
+        step_outputs:
+          transport:
+            subset:
+              crm_write_result:
+                data:
+                  schema: runx.crm_write_result.v1
+                  executed: false
+                  write_result:
+                    before: []
+                    after: []
+        receipt: { schema: runx.receipt.v1 }
+
 runners:
   reconcile:
     default: true
@@ -444,3 +505,46 @@ runners:
           artifacts:
             named_emits:
               crm_update_proposal: crm_update_proposal
+
+  apply:
+    type: graph
+    inputs:
+      crm_update_proposal:
+        type: object
+        required: true
+        description: Sealed proposal from the reconcile runner.
+      crm_records:
+        type: json
+        required: true
+        description: Current CRM records; the mock transport applies updates in memory.
+    graph:
+      name: crm-cleanup-apply
+      result_from: [transport]
+      steps:
+        - id: transport
+          label: execute proposed updates through the mock CRM transport
+          inputs:
+            crm_update_proposal: $input.crm_update_proposal
+            crm_records: $input.crm_records
+          run:
+            type: javascript
+            module: crm-cleanup.mjs
+            export: applyUpdates
+            outputs:
+              crm_write_result:
+                type: object
+                schema:
+                  required: [schema, executed, reason, write_result]
+                  properties:
+                    schema: { const: runx.crm_write_result.v1 }
+                    executed: { type: boolean }
+                    reason: { type: string }
+                    write_result:
+                      type: object
+                      required: [before, after]
+                      properties:
+                        before: { type: array }
+                        after: { type: array }
+          artifacts:
+            named_emits:
+              crm_write_result: crm_write_result
