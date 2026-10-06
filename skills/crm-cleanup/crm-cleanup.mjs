@@ -8,6 +8,8 @@ export function finalizeUpdates(inputs) {
   const findings = [];
   const updates = [];
   const rejected = [];
+  const seenUpdates = new Set();
+  const slotWinners = new Map();
 
   for (const update of proposed) {
     const recordId = stringValue(update.record_id);
@@ -31,6 +33,18 @@ export function finalizeUpdates(inputs) {
       findings.push({ code: "update.empty_value", message: `update to ${recordId}.${field} carries no target value.` });
       continue;
     }
+    const toKey = JSON.stringify(to) ?? "undefined";
+    const updateKey = `${recordId}${field}${toKey}${quote}`;
+    if (seenUpdates.has(updateKey)) {
+      continue;
+    }
+    seenUpdates.add(updateKey);
+    const slotKey = `${recordId}${field}`;
+    if (slotWinners.has(slotKey) && slotWinners.get(slotKey) !== toKey) {
+      findings.push({ code: "update.conflicting_values", message: `conflicting target values proposed for ${recordId}.${field}; refusing the run rather than picking a winner silently.` });
+      continue;
+    }
+    slotWinners.set(slotKey, toKey);
     updates.push({
       record_id: recordId,
       field,
